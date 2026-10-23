@@ -15,22 +15,46 @@
 // mid-delivery hands the occurrence back for retry once the lease expires, and
 // the number of attempts is capped so a permanently failing occurrence is
 // abandoned with a visible reason instead of retried forever.
+//
+// The claim also issues a fencing token. A worker whose lease lapsed and was
+// taken over by another run cannot report its outcome any more: the completion
+// RPC rejects the stale token and writes nothing, so a resurrected worker can
+// neither mark a live attempt delivered nor move the schedule.
+//
+// A failed push is a retryable failure, not a delivery. Completion and
+// schedule advancement are one transaction (rpc_complete_reminder_delivery),
+// and the reminder is only advanced when delivery actually succeeded. Retries
+// re-use the existing in-app notification — the unique dedupe_key makes that
+// insert a no-op — and then re-attempt the push, so "notification already
+// exists" never means "push can be skipped".
 // =============================================================================
 
 import { json, preflight } from '../_shared/http.ts';
 import { serviceClient } from '../_shared/supabase.ts';
 import webpush from 'npm:web-push@3.6.7';
 
+/** One row of rpc_due_reminders(). `occurrence` is already resolved in SQL. */
 interface Reminder {
   id: string;
   owner_id: string;
   title: string;
   description: string | null;
   remind_at: string;
-  snoozed_until: string | null;
+  occurrence: string;
   repeat: 'none' | 'daily' | 'weekly' | 'monthly' | 'yearly';
   repeat_until: string | null;
   alarm_enabled: boolean;
+  snoozed_until: string | null;
+  browser_notifications: boolean;
+  user_timezone: string;
+}
+
+interface CompletionResult {
+  ok: boolean;
+  reason?: string;
+  advanced?: boolean;
+  finished?: boolean;
+  next_occurrence?: string | null;
 }
 
 const WORKER = `scheduler:${crypto.randomUUID().slice(0, 8)}`;
@@ -39,11 +63,14 @@ const WORKER = `scheduler:${crypto.randomUUID().slice(0, 8)}`;
 const LEASE_SECONDS = 300;
 /** Total delivery attempts before an occurrence is abandoned. */
 const MAX_ATTEMPTS = 5;
+/** Rows fetched per run. Ordering is by occurrence, so this is a fair cut. */
+const SCAN_LIMIT = 200;
 
 interface ClaimResult {
   claimed: boolean;
   attempt: number;
   reason: string;
+  token: string | null;
 }
 
 /**
@@ -52,8 +79,11 @@ interface ClaimResult {
  * double-send.
  */
 function normaliseClaim(data: unknown): ClaimResult {
+  // A bare boolean is only ever returned by a pre-0011 deployment. It carries
+  // no fencing token, and without a token the completion call cannot be made,
+  // so treat it as "not claimed" rather than delivering without a lease.
   if (typeof data === 'boolean') {
-    return { claimed: data, attempt: 1, reason: data ? 'new' : 'lease_active' };
+    return { claimed: false, attempt: 1, reason: 'legacy_claim_without_token', token: null };
   }
   if (data && typeof data === 'object') {
     const record = data as Record<string, unknown>;
@@ -61,60 +91,16 @@ function normaliseClaim(data: unknown): ClaimResult {
       claimed: record.claimed === true,
       attempt: typeof record.attempt === 'number' ? record.attempt : 1,
       reason: typeof record.reason === 'string' ? record.reason : 'unknown',
+      token: typeof record.token === 'string' ? record.token : null,
     };
   }
-  return { claimed: false, attempt: 1, reason: 'unknown' };
+  return { claimed: false, attempt: 1, reason: 'unknown', token: null };
 }
 
 /** Linear backoff: 60s, 120s, 180s … so a flapping device is not hammered. */
 function retryAfterFor(attempt: number): number {
   return Math.max(60, 60 * Math.max(1, attempt));
 }
-
-/** Add one repeat interval in the user's timezone, so DST does not drift. */
-const nextOccurrence = (iso: string, repeat: Reminder['repeat'], timeZone: string): Date => {
-  const base = new Date(iso);
-  if (repeat === 'none') return base;
-
-  const parts = new Intl.DateTimeFormat('en-CA', {
-    timeZone,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-  }).formatToParts(base);
-
-  const get = (type: string) => Number(parts.find((p) => p.type === type)?.value ?? 0);
-  const wall = new Date(Date.UTC(get('year'), get('month') - 1, get('day'), get('hour'), get('minute')));
-
-  if (repeat === 'daily') wall.setUTCDate(wall.getUTCDate() + 1);
-  if (repeat === 'weekly') wall.setUTCDate(wall.getUTCDate() + 7);
-  if (repeat === 'monthly') wall.setUTCMonth(wall.getUTCMonth() + 1);
-  if (repeat === 'yearly') wall.setUTCFullYear(wall.getUTCFullYear() + 1);
-
-  // Re-express the wall clock in the user's zone.
-  const offsetMinutes = (date: Date, zone: string) => {
-    const dtf = new Intl.DateTimeFormat('en-US', {
-      timeZone: zone,
-      hour12: false,
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-    });
-    const p = dtf.formatToParts(date);
-    const num = (t: string) => Number(p.find((x) => x.type === t)?.value ?? 0);
-    const asUTC = Date.UTC(num('year'), num('month') - 1, num('day'), num('hour'), num('minute'), num('second'));
-    return (asUTC - date.getTime()) / 60000;
-  };
-
-  const guess = new Date(wall.getTime() - offsetMinutes(base, timeZone) * 60000);
-  return new Date(wall.getTime() - offsetMinutes(guess, timeZone) * 60000);
-};
 
 Deno.serve(async (req) => {
   const origin = req.headers.get('origin');
@@ -146,41 +132,75 @@ Deno.serve(async (req) => {
   const now = new Date();
   const horizon = new Date(now.getTime() + 60_000).toISOString();
 
-  // Only rows that have not already been delivered. One-time reminders carry
-  // fired_at after delivery, so they drop out permanently instead of being
-  // re-selected on every run (the previous duplicate-delivery bug).
-  const { data: due, error } = await supabase
-    .from('reminders')
-    .select('id, owner_id, title, description, remind_at, snoozed_until, repeat, repeat_until, alarm_enabled')
-    .eq('is_dismissed', false)
-    .is('fired_at', null)
-    .lte('remind_at', horizon)
-    .order('remind_at', { ascending: true })
-    .limit(200);
+  /**
+   * Report the outcome of a claimed attempt.
+   *
+   * Completion and schedule advancement happen in ONE transaction inside
+   * rpc_complete_reminder_delivery, fenced on the claim token. The Edge Function
+   * never writes to `reminders` itself: doing so previously advanced a reminder
+   * before the push result was known, which made a failed occurrence
+   * unselectable and therefore impossible to retry.
+   */
+  const complete = async (
+    reminder: Reminder,
+    claim: ClaimResult,
+    pushOk: boolean,
+    error: string | null,
+  ): Promise<CompletionResult | null> => {
+    const { data, error: rpcError } = await supabase.rpc('rpc_complete_reminder_delivery', {
+      p_reminder_id: reminder.id,
+      p_occurrence: reminder.occurrence,
+      p_token: claim.token,
+      p_push_ok: pushOk,
+      p_error: error,
+      p_retry_after_seconds: pushOk ? 0 : retryAfterFor(claim.attempt),
+    });
+
+    if (rpcError) {
+      console.error('completion failed', reminder.id, rpcError.message);
+      return null;
+    }
+
+    const result = (data ?? {}) as CompletionResult;
+    if (result.ok === false) {
+      // stale_claim: another worker owns this occurrence now. Nothing to do —
+      // and deliberately nothing written.
+      console.warn('completion refused', reminder.id, result.reason);
+    }
+    return result;
+  };
+
+  // Due selection happens in SQL, on the *effective* occurrence
+  // (coalesce(snoozed_until, remind_at)). Selecting on remind_at and then
+  // discarding future snoozes in TypeScript meant those rows still consumed
+  // the row limit, so a pile of snoozed reminders could hide the ones that
+  // were genuinely due. The RPC also joins the user's preference row and
+  // timezone, so one round trip answers everything the loop needs.
+  const { data: dueRows, error } = await supabase.rpc('rpc_due_reminders', {
+    p_horizon: horizon,
+    p_limit: SCAN_LIMIT,
+  });
 
   if (error) {
     console.error('reminder scan failed', error.message);
     return json({ ok: false, error: 'scan_failed' }, 500, origin);
   }
 
+  const due = (dueRows ?? []) as Reminder[];
+
   let notified = 0;
   let pushed = 0;
   let skipped = 0;
   let failed = 0;
+  let retried = 0;
 
-  for (const reminder of (due ?? []) as Reminder[]) {
-    const occurrence = reminder.snoozed_until ?? reminder.remind_at;
+  for (const reminder of due) {
+    const occurrence = reminder.occurrence;
 
-    // A snooze pushes the occurrence into the future; leave it for later.
-    if (new Date(occurrence) > new Date(horizon)) {
-      skipped += 1;
-      continue;
-    }
-
-    // Claim first. The claim is a time-bounded lease: if this worker dies
-    // mid-delivery the occurrence becomes claimable again after LEASE_SECONDS
-    // instead of being stuck forever, and attempts are capped so a
-    // permanently failing occurrence cannot be retried without limit.
+    // Claim first. The claim is a time-bounded lease with a fencing token: if
+    // this worker dies mid-delivery the occurrence becomes claimable again
+    // after LEASE_SECONDS, and the dead worker can no longer write its outcome
+    // over the live attempt.
     const { data: claimData, error: claimError } = await supabase.rpc('rpc_claim_reminder', {
       p_reminder_id: reminder.id,
       p_occurrence: occurrence,
@@ -195,30 +215,22 @@ Deno.serve(async (req) => {
       continue;
     }
 
-    // PostgREST returns the jsonb object; older deployments returned a boolean,
-    // so both shapes are accepted rather than silently treating an object as
-    // truthy and double-sending.
     const claim = normaliseClaim(claimData);
-    if (!claim.claimed) {
+    if (!claim.claimed || !claim.token) {
       if (claim.reason === 'attempts_exhausted') {
+        // Bounded give-up: the occurrence stays undelivered and is reported, so
+        // an operator can see it rather than it silently retrying for ever.
         console.error('reminder abandoned after too many attempts', reminder.id, occurrence);
         failed += 1;
       } else {
-        // already_delivered / lease_active / lease_expired: another run owns it,
-        // or there is nothing left to do. Neither is an error.
+        // already_delivered / lease_active: another run owns it, or there is
+        // nothing left to do. Neither is an error.
         skipped += 1;
       }
       continue;
     }
 
-    // Respect the user's preference: no preference row is treated as the
-    // conservative default (in-app only, no system notification).
-    const { data: prefs } = await supabase
-      .from('notification_preferences')
-      .select('browser_notifications, timezone')
-      .eq('user_id', reminder.owner_id)
-      .maybeSingle();
-
+    // ---- in-app notification (deduplicated independently of the push) ----
     const { error: insertError } = await supabase.from('notifications').insert({
       user_id: reminder.owner_id,
       kind: 'reminder',
@@ -228,26 +240,26 @@ Deno.serve(async (req) => {
       dedupe_key: `reminder:${reminder.id}:${occurrence}`,
     });
 
-    // 23505 means the occurrence was already recorded (a previous partial run);
-    // the claim still owns delivery, so pushing once more is safe but pointless.
+    // 23505 means a previous attempt already wrote this notification. That is
+    // NOT the same as "delivered": the push may have failed then, so we fall
+    // through and attempt the push again. The dedupe_key keeps the in-app row
+    // single no matter how many retries happen.
     const alreadyRecorded = insertError?.code === '23505';
     if (insertError && !alreadyRecorded) {
       console.error('notification insert failed', insertError.message);
-      await supabase.rpc('rpc_mark_reminder_delivery', {
-        p_reminder_id: reminder.id,
-        p_occurrence: occurrence,
-        p_delivered: false,
-        p_error: `notification insert: ${insertError.message}`,
-        p_retry_after_seconds: retryAfterFor(claim.attempt),
-      });
+      await complete(reminder, claim, false, `notification insert: ${insertError.message}`);
       failed += 1;
       continue;
     }
     if (!insertError) notified += 1;
+    if (alreadyRecorded) retried += 1;
 
+    // ---- push ----
+    // browser_notifications comes from the preference row, defaulting to the
+    // column default (false = in-app only) when the user has no row at all.
     let pushError: string | null = null;
 
-    if (pushEnabled && prefs?.browser_notifications !== false && !alreadyRecorded) {
+    if (pushEnabled && reminder.browser_notifications) {
       const { data: subs } = await supabase
         .from('push_subscriptions')
         .select('id, endpoint, p256dh, auth')
@@ -262,7 +274,10 @@ Deno.serve(async (req) => {
               body: reminder.description ?? 'LunaDesk reminder',
               tag: `reminder:${reminder.id}:${occurrence}`,
               url: '/#/reminders',
-              requireInteraction: true,
+              // Honour the per-reminder alarm flag: without it the notification
+              // is informational only, and does not demand interaction.
+              requireInteraction: reminder.alarm_enabled,
+              silent: !reminder.alarm_enabled,
             }),
           );
           pushed += 1;
@@ -279,57 +294,22 @@ Deno.serve(async (req) => {
       }
     }
 
-    // Persist the new state only after the claim is owned, so a crash between
-    // claim and update leaves a claim row rather than a silent re-send.
-    if (reminder.repeat === 'none') {
-      await supabase
-        .from('reminders')
-        .update({ fired_at: now.toISOString(), snoozed_until: null })
-        .eq('id', reminder.id);
-    } else {
-      // Advance past "now" in one step: after downtime we notify once for the
-      // backlog instead of replaying every missed occurrence.
-      let next = nextOccurrence(reminder.remind_at, reminder.repeat, prefs?.timezone ?? 'Asia/Kolkata');
-      let guard = 0;
-      while (next.getTime() <= now.getTime() && guard < 400) {
-        next = nextOccurrence(next.toISOString(), reminder.repeat, prefs?.timezone ?? 'Asia/Kolkata');
-        guard += 1;
-      }
-
-      const expired = reminder.repeat_until && next.toISOString().slice(0, 10) > reminder.repeat_until;
-
-      await supabase
-        .from('reminders')
-        .update(
-          expired
-            // Series finished: terminal state, same as a one-time reminder.
-            ? { fired_at: now.toISOString(), snoozed_until: null }
-            // Next occurrence is pending, so clear fired_at (it means "this
-            // occurrence was delivered", not "this reminder is finished").
-            : { remind_at: next.toISOString(), fired_at: null, snoozed_until: null },
-        )
-        .eq('id', reminder.id);
-    }
-
-    await supabase.rpc('rpc_mark_reminder_delivery', {
-      p_reminder_id: reminder.id,
-      p_occurrence: occurrence,
-      p_delivered: pushError === null,
-      p_error: pushError,
-      // A failed push releases the lease so the next run can retry the push
-      // without re-sending an in-app notification (the dedupe_key prevents a
-      // second row).
-      p_retry_after_seconds: pushError === null ? 0 : retryAfterFor(claim.attempt),
-    });
+    // ---- completion ----
+    // One transactional call decides what happens next: on success the reminder
+    // is advanced/finished here, on failure the lease is released and the
+    // occurrence stays due. The Edge Function no longer writes reminder state.
+    const done = await complete(reminder, claim, pushError === null, pushError);
     if (pushError) failed += 1;
+    if (done && done.advanced === false && done.reason === 'retry_scheduled') retried += 1;
   }
 
   return json(
     {
       ok: true,
-      checked: due?.length ?? 0,
+      checked: due.length,
       notified,
       pushed,
+      retried,
       skipped,
       failed,
       push_enabled: pushEnabled,

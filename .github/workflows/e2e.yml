@@ -1,0 +1,52 @@
+name: Browser tests
+
+# Reproducible UI checks. They run against `vite preview` in DEMO mode, so no
+# Supabase project, no secrets and no network access to anything outside the
+# runner are required.
+#
+# This replaces the ad-hoc Playwright session that produced the browser results
+# in the first audit: that proved the app worked on the day, but nothing in the
+# repository could re-run it.
+#
+# Not covered here, and impossible without a live project: real sign-in against
+# Supabase Auth, PostgREST queries, RLS enforcement and the Edge Functions.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: Chromium smoke tests (demo mode)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install
+        run: npm ci --no-audit --no-fund
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Run browser tests
+        run: npx playwright test
+        env:
+          CI: 'true'
+
+      - name: Upload report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7

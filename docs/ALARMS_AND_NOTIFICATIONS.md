@@ -97,9 +97,58 @@ reminder simply never rang again. Now:
 - the daily prune deletes settled claims but keeps undelivered ones that are
   still inside their attempt budget, so recovery survives housekeeping.
 
-`send-reminders` accepts both the current jsonb claim result and the older
-boolean return, so a stale deployment cannot be read as "claimed" and
-double-send.
+Every claim also carries a **fencing token**. A worker that stalls past its
+lease is superseded by the next run; when it finally wakes up and tries to
+report, `rpc_complete_reminder_delivery` rejects the stale token with
+`reason = 'stale_claim'` and writes nothing — it can neither mark a live attempt
+delivered nor move the schedule. Without fencing, the resurrected worker would
+overwrite the newer attempt's state.
+
+A pre-0011 deployment returned a bare boolean from the claim; that carries no
+token, so it is treated as "not claimed" rather than being allowed to deliver
+without a lease.
+
+## Retry semantics
+
+The rule is: **the reminder is advanced only when delivery actually succeeded.**
+
+`rpc_complete_reminder_delivery` does completion and schedule advancement in one
+transaction, and takes the push outcome as an argument:
+
+| Outcome | Reminder state | Delivery row | Next run |
+| --- | --- | --- | --- |
+| `p_push_ok = true` | one-time → `fired_at`; repeating → `remind_at` stepped forward | `delivered`, no lease | nothing to do |
+| `p_push_ok = false` | **untouched** — no `fired_at`, no advance | `delivered = false`, lease released after a backoff | retries the same occurrence |
+
+This is the defect the earlier version had: it advanced the reminder *before*
+recording the push result, so a failed push consumed the occurrence and the user
+never got the alert.
+
+The in-app notification and the push are independent. The notification is
+written first, keyed by `reminder:<id>:<occurrence>`; a retry hits the unique
+index (SQLSTATE 23505) and skips the insert, then **still re-attempts the push**.
+"Notification already exists" never means "delivery is complete".
+
+## Preferences
+
+`browser_notifications` defaults to `false` in the schema, and a user with no
+preference row at all resolves to that same `false`: in-app only, no system
+notification. `rpc_due_reminders()` returns the resolved value, so the scheduler
+cannot apply a different default from the database, and the code and this
+document now agree.
+
+`alarm_enabled` is carried to the scheduler and mapped onto the notification:
+`requireInteraction` and `silent` are set from it, so a reminder the user marked
+as informational does not insist on interaction.
+
+## The due queue
+
+The scan selects on `coalesce(snoozed_until, remind_at)`, ordered by the same
+expression. It previously filtered and ordered on `remind_at` and then discarded
+future snoozes in application code — but those rows had already consumed the
+scan limit, so a pile of reminders snoozed into the future could hide the ones
+that were genuinely due. A snoozed reminder now simply is not selected until its
+snooze elapses.
 
 In the browser, `ReminderWatcher` keys its in-flight set on
 `reminder.id + occurrence`, so the same occurrence cannot ring twice while a

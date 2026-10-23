@@ -178,6 +178,35 @@ immediately exchanges for a session.
    and a secret scan (`scripts/scan-secrets.mjs`).
 5. Push to `main`. The workflow typechecks, builds, and publishes `dist/`.
 
+## Bootstrap the first administrator
+
+`scripts/bootstrap-admin.sql` is run once, in the Supabase SQL editor. It ships
+with unmistakable `REPLACE-WITH-…` placeholders and **refuses to run** until you
+replace both; it also refuses if the auth user does not exist, keeps exactly one
+live lookup code per account, writes an audit row, and **never prints the access
+code** (SQL editor output ends up in screenshots and tickets). See the comment
+block at the top of the file.
+
+## Test suites
+
+| Command | What it proves | Needs |
+| --- | --- | --- |
+| `npm run typecheck` | TypeScript compiles | — |
+| `npm run check:rpc` | every bridged browser call maps to a real, granted SQL function | — |
+| `npm run check:secrets` | no credential-shaped strings in tracked files | — |
+| `npm run check:secrets:history` | same, across all committed blobs | a git checkout |
+| `npm run verify:db` | all migrations apply; 161 RLS/RPC assertions pass | PostgreSQL 17 |
+| `npm run test:bootstrap` | the bootstrap script refuses placeholders and never leaks the code | PostgreSQL 17 |
+| `npm run test:concurrency` | two simultaneous admin deactivations cannot empty the workspace | PostgreSQL 17 |
+| `npm run test:verifier` | the migration verifier really fails on a broken migration | PostgreSQL 17 |
+| `npm run test:e2e` | 10 Chromium tests: every route, guards, deep links, back/forward, one payment, three viewports | Chromium (`npx playwright install --with-deps chromium`) |
+
+The database suites run against a throwaway local database and never touch a
+Supabase project. `verify:db`, `test:bootstrap`, `test:concurrency` and
+`test:verifier` all run in `.github/workflows/database.yml` against a
+`postgres:17` service container; `test:e2e` runs in
+`.github/workflows/e2e.yml`.
+
 Routing uses `HashRouter`, so deep links such as
 `https://<you>.github.io/lunadesk/#/admin/payments` survive a refresh on a static
 host with no 404 tricks.

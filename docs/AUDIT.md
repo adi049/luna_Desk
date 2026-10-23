@@ -1,8 +1,8 @@
 # Pre-Supabase audit — LunaDesk
 
-Date: 2026-10-23, extended 2026-10-24
-Scope: the repository as committed at `0e38f7d`, hardened locally in two rounds
-(§9 is the second round).
+Date: 2026-10-23, extended 2026-10-24 (twice)
+Scope: the repository as committed at `ae7c200`, hardened locally in three
+rounds. §9 is the second round, §10 the third.
 **No live Supabase project was contacted, created or modified.** Every database
 result below comes from a local PostgreSQL 17 instance running the migrations in
 `supabase/migrations/`.
@@ -571,3 +571,231 @@ authenticated against, written to, or been deployed with a real Supabase
 project. The Edge Functions have not been executed on Supabase's runtime; the
 SQL has only run on stock PostgreSQL 17 with an `auth` shim. Treat the code as
 ready for a staging deployment, not as production-proven.
+
+---
+
+# 10. Third hardening round (2026-10-24)
+
+Each finding below was reproduced against a throwaway database first, then
+fixed, then covered by a test that fails without the fix.
+
+## 10.1 Every SECURITY DEFINER function now has an explicit privilege decision
+
+**Reproduced.** PostgreSQL grants `EXECUTE` to `PUBLIC` on every new function,
+and `PUBLIC` includes `anon`. Functions created without an explicit `REVOKE`
+were therefore callable with no session at all. Verified as `anon`:
+
+```
+select public.next_document_number('LD-RCP-');   ->  LD-RCP--2026-0001
+select public.audit('forged.action', …);         ->  CALL SUCCEEDED (no error)
+select public.sync_invoice_status(<invoice>);    ->  CALL SUCCEEDED (no error)
+```
+
+Three real consequences: an unauthenticated caller could consume receipt and
+invoice numbers (numbering gaps in financial documents are not cosmetic), could
+append rows to the audit trail, and could trigger an invoice status rewrite.
+`derive_invoice_status`, `assert_admin` and `access_attempts_exceeded` were
+exposed the same way.
+
+**Fixed** (`0010_function_privileges.sql`). The allowlist is data, not code:
+`public.function_privilege_policy(function_name, role_name)` names what may be
+called and by whom. `enforce_function_privileges()` revokes every grant from
+every non-extension function in `public` and re-grants exactly the table's rows,
+resolving signatures from the catalogue so a changed signature cannot leave a
+stale grant open. It is owner-only, so it cannot be used to re-grant anything.
+The same policy is installed with `ALTER DEFAULT PRIVILEGES`, so a function
+added later is closed until someone deliberately opens it — and
+`rpc_complete_reminder_delivery` / `rpc_due_reminders` were added in `0011` by
+inserting two rows and re-running the function.
+
+Two deliberate non-effects: trigger functions keep working (PostgreSQL does not
+check `EXECUTE` when firing a trigger), and internal calls keep working (each
+`rpc_*` is `SECURITY DEFINER`, so the check is against the owner).
+
+One trap worth recording: `ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE …`
+silently records nothing on this PostgreSQL — a function created afterwards was
+still world-executable. The global form does work, so it is used, with an
+explicit per-schema override restoring `PUBLIC` execute in `auth` where RLS
+policy helpers need it.
+
+**Proven.** `supabase/tests/rls.sql` §8: 14 assertions covering the allowlist,
+the absence of any implicit `PUBLIC` grant, the default-privileges behaviour for
+a function created after the migration, five refused calls from a client
+session with before/after checks on the sequence, the audit log and the invoice
+row, and a positive control that an RPC can still draw a receipt number
+internally. A mutation that re-granted `audit()` to `anon` fails with
+`FAIL: audit() is not executable by anon or authenticated`.
+
+## 10.2 Reminder retry could not retry
+
+**Reproduced.** `send-reminders` advanced the reminder (set `fired_at`, or moved
+`remind_at`) *before* it recorded whether the push succeeded. A failed push
+therefore consumed the occurrence: the row was no longer due and the user never
+received the alert.
+
+Four further defects found in the same flow:
+
+- **Preferences were never honoured.** The job selected `browser_notifications,
+  timezone` from `notification_preferences`, but **`timezone` is not a column of
+  that table** — it lives on `profiles`. The query errored, the error was
+  ignored, and `prefs` was always `null`, so every user was treated as opted in.
+- **Missing-preference default disagreed with the docs.** The code used
+  `prefs?.browser_notifications !== false`, i.e. push unless explicitly off,
+  while the column default and the documentation both say in-app only.
+- **No fencing.** `rpc_mark_reminder_delivery` matched on `(reminder_id,
+  occurrence)` alone, so a worker whose lease had expired and been reclaimed
+  could still overwrite the live attempt's outcome and move the schedule.
+- **Snoozes starved the queue.** The scan filtered and ordered on `remind_at`
+  and discarded future snoozes in TypeScript, but those rows had already
+  consumed the 200-row limit, hiding genuinely due reminders behind them.
+
+**Fixed** (`0011_reminder_retry_fencing.sql` + a rewritten Edge Function).
+
+| Change | Effect |
+| --- | --- |
+| `rpc_due_reminders(horizon, limit)` | selects and orders on `coalesce(snoozed_until, remind_at)`, joins the preference row and `profiles.timezone` |
+| `rpc_claim_reminder(...)` | now issues a per-attempt `claim_token` |
+| `rpc_complete_reminder_delivery(..., p_token, p_push_ok, …)` | fenced on the token; completion **and** schedule advancement in one transaction; advances only on success |
+| `next_occurrence_tz(...)` | recurrence stepped in the user's zone, so a 09:00 daily reminder stays at 09:00 across DST |
+| `rpc_mark_reminder_delivery(...)` | **dropped** — leaving an unfenced way to write delivery state would defeat the fencing |
+
+The Edge Function now: reads due rows from the RPC, claims, writes the in-app
+notification (deduplicated independently), and re-attempts the push on a retry
+rather than treating an existing notification as delivery. `alarm_enabled` is
+mapped onto `requireInteraction` / `silent`.
+
+**Proven.** `supabase/tests/rls.sql` §5g–5R (48 assertions), covering: a failed
+one-time push leaves `fired_at` null and the row still selected; a failed
+repeating push does not advance `remind_at`; a duplicate notification row still
+results in a push retry and only one notification row; a stale worker with a
+dead token is refused and cannot advance or mark delivered while the owning
+worker still can; 25 reminders snoozed two days out do not hide a due reminder
+from a 10-row scan, and become due when the snooze elapses; a recurring reminder
+advances only on success, keeps its local wall-clock time, is not marked
+finished, and finishes at `repeat_until`; the preference default is in-app only.
+
+Two mutations were applied to confirm the tests bite: reverting the due query to
+`remind_at` fails with `FAIL: a due reminder is selected even when many others
+are snoozed into the future`; advancing the schedule on a failed push fails with
+`FAIL: a failed one-time delivery does not set fired_at`.
+
+## 10.3 Concurrent admin deactivation emptied the workspace
+
+**Reproduced.** Two administrators deactivating each other at the same moment
+each took a row lock on the *other* row and counted the other as the surviving
+administrator. Both commits went through and the workspace was left with zero
+active administrators, locked out of every admin RPC.
+
+**Fixed** (`0012_admin_deactivation_serialised.sql`). A transaction-scoped
+advisory lock (`pg_advisory_xact_lock(hashtext('lunadesk.admin_state'))`) is
+taken before the target row is read, so the active-admin count is always
+evaluated against committed state. It is transaction-scoped, so a failed or
+abandoned transaction releases it automatically. The migration also asserts that
+the lock is taken before the row is read.
+
+**Proven** by `scripts/test-admin-concurrency.sh`, which is the only honest way
+to test this: SQL cannot express two overlapping transactions, so the script
+drives two real psql sessions, staggering session B by 0.6 s while session A
+holds its transaction open for 2 s, for 5 rounds. Against the previous
+definition it reports `BOTH deactivations committed — the workspace has no
+active admin` and fails 6/6; with the fix it passes 10/10.
+
+## 10.4 Bootstrap script
+
+The script shipped with `owner@managedbyluna.com` and the code `ADI000` as
+defaults, so running it unchanged silently created a working administrator whose
+code is published in the repository — and it printed the code in a `NOTICE`.
+
+Now: unmistakable `REPLACE-WITH-…` placeholders and a hard refusal to run until
+both are replaced; the sentinels are built by concatenation so a global
+find-and-replace over the file does not trip the check; the email and code
+format are validated; a missing auth user aborts before anything is written;
+earlier codes are revoked so exactly one stays live; an `admin.bootstrap` audit
+row is written; and the success notice deliberately omits the code.
+
+**Proven** by `scripts/test-bootstrap.sh` (10 assertions), including a check
+that the code is not stored in plain text.
+
+## 10.5 Admin client creation was capped at 200 users
+
+`admin-clients` looked up an existing auth user with
+`listUsers({ page: 1, perPage: 200 })` and searched that page only. Past 200
+users the lookup missed existing accounts, so portal creation for an older
+client tried to recreate the address and failed with "user already registered" —
+which looks like a transient error, not a lookup gap.
+
+Now the lookup walks pages (bounded at 10 000 accounts, then a clear error
+rather than an unbounded loop), and creation is treated as a race: if
+`createUser` fails, the lookup is re-run and the existing id is used, so two
+admins creating the same portal concurrently both succeed.
+
+Not covered by an automated test — it needs the Supabase Auth Admin API, which
+this environment cannot reach. Stated as unverified, not as passing.
+
+## 10.6 Verification is now reproducible
+
+- `.github/workflows/database.yml` runs the migrations, the RLS/RPC suite, the
+  bootstrap test, the concurrency test and the migration-verifier meta-test on
+  a `postgres:17` service container, plus typecheck, RPC contract and both
+  secret scans.
+- `.github/workflows/e2e.yml` runs the browser tests.
+- `e2e/smoke.spec.ts` + `playwright.config.ts` replace the previous ad-hoc
+  Playwright session, which proved the app worked on the day but could not be
+  re-run by anyone else. Ten tests: the landing page, a rejected access code,
+  all 16 admin routes with zero console errors, deep link + reload, back/forward,
+  a recorded payment changing the table, all 10 portal routes plus the guard
+  keeping a client out of `/admin`, and no horizontal overflow at 390/768/1440.
+
+## 10.6b Two bugs found in the test tooling itself
+
+Worth recording, because both made a *pass* look like a failure and could as
+easily have done the reverse:
+
+- **`printf … | grep -q` under `set -o pipefail`.** `grep -q` exits the moment
+  it matches, `printf` then dies of `SIGPIPE`, and the pipeline reports failure
+  even though the match succeeded. `scripts/test-verify-migrations.sh` failed
+  about one run in three for no reason at all. Every such check now uses a
+  here-string (`grep -qF -- "$needle" <<<"$output"`), which has no pipe and no
+  `SIGPIPE`. Verified stable over six consecutive runs.
+- **A meta-test that edited a tracked file.** The verifier meta-test used to
+  mutate `supabase/tests/rls.sql` in place and restore it in a trap. An
+  interrupted run left a broken suite behind, and a later run could read the
+  mutated version. The verifier now takes a `TEST_SUITE` override, so mutated
+  copies live in a temp directory, and the script asserts the tracked suite is
+  byte-identical afterwards.
+- **A reusable preview server.** `reuseExistingServer` let a leftover
+  `vite preview` serve a stale bundle, which failed every browser test with no
+  visible cause. Playwright now always starts its own server.
+
+## 10.7 Checks actually run in this round
+
+| Command | Result |
+| --- | --- |
+| `npm run typecheck` | pass |
+| `npm run check:rpc` | pass — 39 SQL functions parsed, 7 bridged calls matched |
+| `npm run check:secrets` / `:history` | pass |
+| `npm run verify:db` (PostgreSQL 17.11) | pass — **12 migrations, 161 assertions** |
+| `npm run test:bootstrap` | pass — 10/10 |
+| `npm run test:concurrency` | pass — 10/10 (and fails 6/6 against the pre-fix function) |
+| `npm run test:verifier` | pass — 13/13 |
+| `npm run test:e2e` (Chromium 156, demo mode) | pass — 10/10 |
+| `CI=true` live build with realistic values | pass |
+| live build with `.env.example` placeholders | correctly refuses |
+| mutations: re-grant `audit()` to anon · due query on `remind_at` · advance on failed push | each fails the suite |
+
+## 10.8 Still not verified, and why
+
+| Not verified | Reason |
+| --- | --- |
+| Edge Functions executed on Supabase's runtime | Needs the Deno runtime plus a project's Auth Admin API and secrets. Their **database half** is tested; the TypeScript around it is typechecked but not executed. `admin-clients` pagination is therefore unverified. |
+| RLS/RPC against a real Supabase instance | No project permitted. Tested on PostgreSQL 17.11 with an `auth` shim; PostgREST-specific behaviour is inferred. |
+| Real Web Push delivery, `pg_cron` scheduling, DST across a real boundary | Need a deployed project and real devices. |
+| Storage bucket policies | Need a real bucket. |
+
+## 10.9 Production readiness
+
+**Still not claimed.** The security defects found in this round were real and
+are fixed and guarded, but the application has never authenticated against,
+written to, or been deployed with a real Supabase project, and the Edge
+Functions have never run on Supabase's runtime. Treat this as ready for a
+staging deployment against a real project, with §7 and §10.8 checked there.

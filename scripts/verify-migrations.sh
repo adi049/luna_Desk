@@ -15,8 +15,9 @@
 # exit status and the error text — a migration with a syntax error still printed
 # "✓ schema verified" and exited 0.
 #
-# MIGRATIONS_DIR can be pointed at another directory (used by
-# scripts/test-verify-migrations.sh to prove failures are detected).
+# MIGRATIONS_DIR, HARNESS and TEST_SUITE can be pointed elsewhere (used by
+# scripts/test-verify-migrations.sh to prove failures are detected without
+# modifying any tracked file).
 # =============================================================================
 set -euo pipefail
 
@@ -24,8 +25,12 @@ cd "$(dirname "$0")/.."
 
 DATABASE="${DATABASE:-lunadesk_verify}"
 MIGRATIONS_DIR="${MIGRATIONS_DIR:-supabase/migrations}"
-HARNESS="scripts/sql-harness.sql"
-TEST_SUITE="supabase/tests/rls.sql"
+HARNESS="${HARNESS:-scripts/sql-harness.sql}"
+# TEST_SUITE lets scripts/test-verify-migrations.sh point at a mutated *copy* of
+# the suite instead of editing the real file. Mutating a tracked file from a
+# test is a shared-state hazard: an interrupted run leaves a broken suite
+# behind, and a concurrent run can read the mutated version.
+TEST_SUITE="${TEST_SUITE:-supabase/tests/rls.sql}"
 
 # One scratch file per run; the trap guarantees it is removed.
 LOG="$(mktemp "${TMPDIR:-/tmp}/lunadesk-verify.XXXXXX")"

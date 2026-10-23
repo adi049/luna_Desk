@@ -1,0 +1,99 @@
+name: Database checks
+
+# The SQL is the security boundary, so it gets its own workflow rather than
+# riding along with the Pages deploy. Every job here runs against a throwaway
+# PostgreSQL database inside the runner: no Supabase project is contacted and no
+# credential is needed.
+#
+# What this proves:
+#   * every migration applies cleanly, in order, and the RLS/RPC suite passes;
+#   * the migration verifier actually fails on a broken migration, a failing
+#     assertion, a truncated suite and an empty directory (the verifier is the
+#     gate, so a gate that always opens is worse than none);
+#   * concurrent admin deactivations cannot empty the workspace;
+#   * the first-run bootstrap script cannot be run by accident and never prints
+#     the access code.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  schema:
+    name: Migrations, RLS and RPC
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      PGHOST: 127.0.0.1
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      DATABASE: lunadesk_ci
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17 || sudo apt-get install -y postgresql-client
+          psql --version
+
+      - name: Apply migrations and run the RLS/RPC suite
+        run: bash scripts/verify-migrations.sh
+
+      - name: Bootstrap script behaves as documented
+        run: bash scripts/test-bootstrap.sh
+
+      - name: Concurrent admin deactivation cannot empty the workspace
+        run: bash scripts/test-admin-concurrency.sh
+
+      - name: The migration verifier really detects failures
+        run: bash scripts/test-verify-migrations.sh
+
+  static:
+    name: Types, RPC contract and secrets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci --no-audit --no-fund
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: RPC contract (browser bridge vs SQL)
+        run: node scripts/check-rpc-contract.mjs
+
+      - name: Secret scan (working tree)
+        run: node scripts/scan-secrets.mjs
+
+      - name: Secret scan (git history)
+        run: node scripts/scan-secrets.mjs --history

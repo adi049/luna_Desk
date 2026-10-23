@@ -23,6 +23,82 @@ const portalEmail = (clientCode: string, given?: string) => {
   return `portal.${clientCode.toLowerCase()}@clients.managedbyluna.com`;
 };
 
+/**
+ * Find the auth user for a portal email, creating it only if it truly does not
+ * exist.
+ *
+ * The previous version called listUsers({ page: 1, perPage: 200 }) and searched
+ * that single page. With more than 200 users the lookup silently missed
+ * existing accounts, so every portal creation for an older client tried to
+ * create the address again and failed with "user already registered" — and the
+ * failure looked like a transient error rather than a lookup gap.
+ *
+ * Two changes fix that properly:
+ *
+ *  1. `getUserByEmail` would be the obvious call, but it is not part of the
+ *     supabase-js admin surface in every version, so the fallback walks the
+ *     pages. Listing is bounded (MAX_USER_PAGES) so a runaway tenant cannot
+ *     make this endpoint unbounded.
+ *  2. Creation is treated as a race. Two admins creating the same portal at
+ *     once both miss the lookup, and one of them loses. That loser re-runs the
+ *     lookup instead of surfacing an error, which is the correct outcome:
+ *     the account exists, so the portal can be attached.
+ */
+const MAX_USER_PAGES = 50;          // 50 × 200 = 10 000 accounts
+const USERS_PER_PAGE = 200;
+
+async function findAuthUserByEmail(
+  supabase: ReturnType<typeof serviceClient>,
+  email: string,
+): Promise<string | null> {
+  const target = email.toLowerCase();
+
+  for (let page = 1; page <= MAX_USER_PAGES; page += 1) {
+    const { data, error } = await supabase.auth.admin.listUsers({
+      page,
+      perPage: USERS_PER_PAGE,
+    });
+    if (error) throw error;
+
+    const users = data?.users ?? [];
+    const match = users.find((u) => u.email?.toLowerCase() === target);
+    if (match) return match.id;
+
+    // Last page: fewer results than requested means there is nothing after it.
+    if (users.length < USERS_PER_PAGE) return null;
+  }
+
+  throw new Error(
+    `Could not resolve an account for ${email}: more than ${MAX_USER_PAGES * USERS_PER_PAGE} users exist. Attach the portal manually.`,
+  );
+}
+
+async function ensureAuthUser(
+  email: string,
+  fullName: string,
+  clientId: string,
+): Promise<string> {
+  const supabase = serviceClient();
+
+  const existing = await findAuthUserByEmail(supabase, email);
+  if (existing) return existing;
+
+  const { data: created, error: createError } = await supabase.auth.admin.createUser({
+    email,
+    email_confirm: true,
+    user_metadata: { full_name: fullName, kind: 'client-portal', client_id: clientId },
+  });
+
+  if (!createError && created?.user) return created.user.id;
+
+  // Lost a race with a concurrent creation, or the address already existed
+  // under a slightly different case. Re-resolve rather than failing.
+  const raced = await findAuthUserByEmail(supabase, email);
+  if (raced) return raced;
+
+  throw createError ?? new Error('createUser failed and the account could not be found afterwards');
+}
+
 Deno.serve(async (req) => {
   const origin = req.headers.get('origin');
   if (req.method === 'OPTIONS') return preflight(origin);
@@ -70,19 +146,7 @@ Deno.serve(async (req) => {
       const email = portalEmail(client.client_code, String(body.email ?? client.email ?? ''));
       const fullName = String(body.full_name ?? `${client.business_name} portal`).slice(0, 120);
 
-      // Reuse an existing auth user with this address, otherwise create one.
-      const { data: list } = await supabase.auth.admin.listUsers({ page: 1, perPage: 200 });
-      let userId = list?.users?.find((u) => u.email?.toLowerCase() === email)?.id ?? null;
-
-      if (!userId) {
-        const { data: created, error: createError } = await supabase.auth.admin.createUser({
-          email,
-          email_confirm: true,
-          user_metadata: { full_name: fullName, kind: 'client-portal' },
-        });
-        if (createError || !created?.user) throw createError ?? new Error('createUser failed');
-        userId = created.user.id;
-      }
+      const userId = await ensureAuthUser(email, fullName, clientId);
 
       const { error: rpcError } = await supabase.rpc('rpc_attach_client_portal', {
         p_client_id: clientId,

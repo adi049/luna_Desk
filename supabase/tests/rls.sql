@@ -22,6 +22,12 @@ begin
   raise notice 'ok — %', p_label;
 end $$;
 
+-- Migration 0010 removes the implicit PUBLIC execute grant from new functions,
+-- which is exactly what we want for application functions. This helper is
+-- called from test blocks that run as `authenticated` / `anon`, so it opts back
+-- in explicitly. It exists only in the throwaway test database.
+grant execute on function public.test_assert(boolean, text) to public, anon, authenticated, service_role;
+
 begin;
 
 -- ---------------------------------------------------------------------------
@@ -584,10 +590,14 @@ begin
 
   perform public.test_assert((v_first ->> 'claimed')::boolean,
     'the first scheduler run claims the occurrence');
+  perform public.test_assert((v_first ->> 'token') is not null,
+    'the winning claim is issued a fencing token');
   perform public.test_assert((v_second ->> 'claimed')::boolean = false,
     'a concurrent second run cannot claim the same occurrence');
   perform public.test_assert(v_second ->> 'reason' = 'lease_active',
     'the refusal is explained as a live lease, not as success');
+  perform public.test_assert((v_second ->> 'token') is null,
+    'a losing claim receives no token');
   perform public.test_assert(
     (select count(*) from public.reminder_deliveries where reminder_id = v_reminder) = 1,
     'exactly one delivery row exists for one occurrence');
@@ -597,7 +607,8 @@ begin
     (public.rpc_claim_reminder(v_reminder, v_occ + interval '1 day', 'worker-a') ->> 'claimed')::boolean,
     'a later occurrence gets its own claim');
 
-  perform public.rpc_mark_reminder_delivery(v_reminder, v_occ, false, 'push 500');
+  perform public.rpc_complete_reminder_delivery(
+    v_reminder, v_occ, (v_first ->> 'token')::uuid, false, 'push 500', 0);
   perform public.test_assert(
     (select error from public.reminder_deliveries where reminder_id = v_reminder and occurrence = v_occ) = 'push 500',
     'delivery failures are recorded instead of being lost');
@@ -638,6 +649,9 @@ begin
     'the recovery is reported as lease_expired');
   perform public.test_assert((v_recovered ->> 'attempt')::int = 2,
     'the retry is counted as attempt 2');
+  perform public.test_assert(
+    (v_recovered ->> 'token') is distinct from (v_first ->> 'token'),
+    'the reclaiming worker gets a different fencing token');
   perform public.test_assert(
     (select count(*) from public.reminder_deliveries where reminder_id = v_reminder) = 1,
     'recovery reuses the single delivery row rather than creating a second one');
@@ -688,15 +702,17 @@ do $$
 declare
   v_reminder uuid;
   v_occ      timestamptz := date_trunc('minute', now()) + interval '3 hours';
+  v_claim    jsonb;
   v_res      jsonb;
 begin
   insert into public.reminders (owner_id, title, remind_at)
   values ('44444444-4444-4444-8444-444444444444', 'Retry after failure', v_occ)
   returning id into v_reminder;
 
-  perform public.rpc_claim_reminder(v_reminder, v_occ, 'w1', 300, 5);
+  v_claim := public.rpc_claim_reminder(v_reminder, v_occ, 'w1', 300, 5);
   -- A push failure is reported immediately, with no retry delay.
-  perform public.rpc_mark_reminder_delivery(v_reminder, v_occ, false, 'push 500', 0);
+  perform public.rpc_complete_reminder_delivery(
+    v_reminder, v_occ, (v_claim ->> 'token')::uuid, false, 'push 500', 0);
 
   v_res := public.rpc_claim_reminder(v_reminder, v_occ, 'w2', 300, 5);
   perform public.test_assert((v_res ->> 'claimed')::boolean = true,
@@ -705,13 +721,329 @@ begin
     'the retry after failure is attempt 2');
 
   -- Successful delivery ends it.
-  perform public.rpc_mark_reminder_delivery(v_reminder, v_occ, true, null);
+  perform public.rpc_complete_reminder_delivery(
+    v_reminder, v_occ, (v_res ->> 'token')::uuid, true, null);
   perform public.test_assert(
     (select delivered from public.reminder_deliveries where reminder_id = v_reminder and occurrence = v_occ) = true,
     'successful delivery is recorded as delivered');
   perform public.test_assert(
     (select lease_expires_at from public.reminder_deliveries where reminder_id = v_reminder and occurrence = v_occ) is null,
     'a delivered occurrence holds no lease, so nothing can reclaim it');
+end $$;
+
+-- ===========================================================================
+-- 5L–5P. Retry correctness: the failures a scheduler actually hits
+-- ===========================================================================
+
+-- 5L. A failed push must leave the occurrence due, so it is retried ----------
+--     (the original bug: the reminder was marked fired before the push result
+--      was known, so the failed occurrence was never selectable again)
+do $$
+declare
+  v_reminder uuid;
+  v_occ      timestamptz := now() - interval '1 minute';
+  v_claim    jsonb;
+  v_due      integer;
+  v_fired    timestamptz;
+begin
+  insert into public.reminders (owner_id, title, remind_at, repeat)
+  values ('44444444-4444-4444-8444-444444444444', 'Failed push retry', v_occ, 'none')
+  returning id into v_reminder;
+
+  v_claim := public.rpc_claim_reminder(v_reminder, v_occ, 'w1', 300, 5);
+  perform public.rpc_complete_reminder_delivery(
+    v_reminder, v_occ, (v_claim ->> 'token')::uuid, false, 'push 410', 0);
+
+  select fired_at into v_fired from public.reminders where id = v_reminder;
+  select count(*) into v_due
+    from public.rpc_due_reminders(now() + interval '1 minute', 200) d
+   where d.id = v_reminder;
+
+  perform public.test_assert(v_fired is null,
+    'a failed one-time delivery does not set fired_at');
+  perform public.test_assert(v_due = 1,
+    'a failed one-time reminder is still selected by the next due scan');
+  perform public.test_assert(
+    (select delivered from public.reminder_deliveries
+      where reminder_id = v_reminder and occurrence = v_occ) = false,
+    'the delivery row is left undelivered so the retry is visible');
+end $$;
+
+-- 5M. A repeating reminder must not advance past a failed occurrence ---------
+do $$
+declare
+  v_reminder uuid;
+  v_occ      timestamptz := now() - interval '1 minute';
+  v_claim    jsonb;
+  v_after    timestamptz;
+  v_due      integer;
+begin
+  insert into public.reminders (owner_id, title, remind_at, repeat)
+  values ('44444444-4444-4444-8444-444444444444', 'Repeating failure', v_occ, 'daily')
+  returning id into v_reminder;
+
+  v_claim := public.rpc_claim_reminder(v_reminder, v_occ, 'w1', 300, 5);
+  perform public.rpc_complete_reminder_delivery(
+    v_reminder, v_occ, (v_claim ->> 'token')::uuid, false, 'push 500', 0);
+
+  select remind_at into v_after from public.reminders where id = v_reminder;
+  select count(*) into v_due
+    from public.rpc_due_reminders(now() + interval '1 minute', 200) d
+   where d.id = v_reminder;
+
+  perform public.test_assert(v_after = v_occ,
+    'a failed repeating delivery does not advance remind_at');
+  perform public.test_assert(v_due = 1,
+    'the failed repeating occurrence is still due');
+end $$;
+
+-- 5N. Duplicate in-app notification, push retried ---------------------------
+--     The notification row is written before the push, so a retry finds it
+--     already there. Delivery must still re-attempt the push instead of
+--     treating "notification exists" as "fully delivered".
+do $$
+declare
+  v_reminder uuid;
+  v_occ      timestamptz := now() - interval '2 minutes';
+  v_claim    jsonb;
+  v_key      text;
+  v_notifs   integer;
+  v_push_retried boolean := false;
+begin
+  insert into public.reminders (owner_id, title, remind_at, repeat)
+  values ('44444444-4444-4444-8444-444444444444', 'Duplicate notification', v_occ, 'none')
+  returning id into v_reminder;
+  v_key := 'reminder:' || v_reminder || ':' || v_occ;
+
+  -- First attempt: in-app notification written, push fails.
+  insert into public.notifications (user_id, kind, title, dedupe_key)
+  values ('44444444-4444-4444-8444-444444444444', 'reminder', 'Duplicate notification', v_key);
+  v_claim := public.rpc_claim_reminder(v_reminder, v_occ, 'w1', 300, 5);
+  perform public.rpc_complete_reminder_delivery(
+    v_reminder, v_occ, (v_claim ->> 'token')::uuid, false, 'push 500', 0);
+
+  -- Second attempt: the same dedupe_key is inserted again and is a no-op.
+  begin
+    insert into public.notifications (user_id, kind, title, dedupe_key)
+    values ('44444444-4444-4444-8444-444444444444', 'reminder', 'Duplicate notification', v_key);
+  exception when unique_violation then
+    v_push_retried := true;   -- the insert was a duplicate, so the push is what must run
+  end;
+
+  select count(*) into v_notifs from public.notifications
+   where user_id = '44444444-4444-4444-8444-444444444444' and dedupe_key = v_key;
+
+  perform public.test_assert(v_push_retried,
+    'the in-app notification dedupe_key rejects the duplicate row');
+  perform public.test_assert(v_notifs = 1,
+    'exactly one in-app notification exists after the duplicate attempt');
+
+  -- And the occurrence is still retryable, i.e. the push will actually run.
+  v_claim := public.rpc_claim_reminder(v_reminder, v_occ, 'w2', 300, 5);
+  perform public.test_assert((v_claim ->> 'claimed')::boolean,
+    'the occurrence is reclaimable so the push can be retried');
+
+  perform public.rpc_complete_reminder_delivery(
+    v_reminder, v_occ, (v_claim ->> 'token')::uuid, true, null);
+  perform public.test_assert(
+    (select count(*) from public.notifications
+      where user_id = '44444444-4444-4444-8444-444444444444' and dedupe_key = v_key) = 1,
+    'the successful retry adds no second in-app notification');
+  perform public.test_assert(
+    (select fired_at from public.reminders where id = v_reminder) is not null,
+    'the successful retry finishes the one-time reminder');
+end $$;
+
+-- 5O. Fencing: a stale worker cannot write over a reclaimed claim -----------
+do $$
+declare
+  v_reminder uuid;
+  v_occ      timestamptz := now() - interval '3 minutes';
+  v_a        jsonb;
+  v_b        jsonb;
+  v_res      jsonb;
+  v_fired    timestamptz;
+begin
+  insert into public.reminders (owner_id, title, remind_at, repeat)
+  values ('44444444-4444-4444-8444-444444444444', 'Stale worker', v_occ, 'none')
+  returning id into v_reminder;
+
+  v_a := public.rpc_claim_reminder(v_reminder, v_occ, 'worker-a', 300, 5);
+
+  -- Worker A stalls; its lease expires and worker B takes over.
+  update public.reminder_deliveries set lease_expires_at = now() - interval '1 second'
+   where reminder_id = v_reminder and occurrence = v_occ;
+  v_b := public.rpc_claim_reminder(v_reminder, v_occ, 'worker-b', 300, 5);
+  perform public.test_assert((v_b ->> 'claimed')::boolean,
+    'worker B reclaims the expired lease');
+
+  -- Worker A wakes up and tries to report success with its dead token.
+  v_res := public.rpc_complete_reminder_delivery(
+    v_reminder, v_occ, (v_a ->> 'token')::uuid, true, null);
+
+  perform public.test_assert((v_res ->> 'ok')::boolean = false,
+    'a stale worker is refused');
+  perform public.test_assert(v_res ->> 'reason' = 'stale_claim',
+    'the refusal is reported as a stale claim');
+
+  select fired_at into v_fired from public.reminders where id = v_reminder;
+  perform public.test_assert(v_fired is null,
+    'the stale worker cannot advance the reminder schedule');
+  perform public.test_assert(
+    (select delivered from public.reminder_deliveries
+      where reminder_id = v_reminder and occurrence = v_occ) = false,
+    'the stale worker cannot mark the occurrence delivered');
+
+  -- The live worker still completes normally.
+  v_res := public.rpc_complete_reminder_delivery(
+    v_reminder, v_occ, (v_b ->> 'token')::uuid, true, null);
+  perform public.test_assert((v_res ->> 'ok')::boolean and (v_res ->> 'advanced')::boolean,
+    'the worker that actually owns the claim can complete it');
+  perform public.test_assert(
+    (select fired_at from public.reminders where id = v_reminder) is not null,
+    'the owning worker finishes the one-time reminder');
+end $$;
+
+-- 5P. A future snooze cannot starve the due queue ---------------------------
+--     The old scan filtered on remind_at and ordered by remind_at, so rows
+--     snoozed far into the future consumed the row limit and hid reminders that
+--     were genuinely due. The scan now selects on the effective occurrence.
+do $$
+declare
+  v_due_ids    uuid[] := '{}';
+  v_snoozed    uuid;
+  v_real       uuid;
+  v_scan       uuid[];
+  i            integer;
+  v_pad        uuid;
+begin
+  -- 25 reminders snoozed two days out, plus one genuinely due now.
+  for i in 1..25 loop
+    insert into public.reminders (owner_id, title, remind_at, snoozed_until)
+    values ('44444444-4444-4444-8444-444444444444',
+            'Snoozed into the future ' || i,
+            now() - interval '10 days',
+            now() + interval '2 days')
+    returning id into v_pad;
+    if i = 1 then
+      v_snoozed := v_pad;
+    end if;
+  end loop;
+
+  insert into public.reminders (owner_id, title, remind_at)
+  values ('44444444-4444-4444-8444-444444444444', 'Genuinely due now', now() - interval '5 minutes')
+  returning id into v_real;
+
+  -- A small limit is the point: the future snoozes must not occupy slots.
+  select array_agg(d.id) into v_scan
+    from public.rpc_due_reminders(now() + interval '1 minute', 10) d;
+
+  perform public.test_assert(v_real = any (v_scan),
+    'a due reminder is selected even when many others are snoozed into the future');
+  perform public.test_assert(not (v_snoozed = any (v_scan)),
+    'a reminder snoozed into the future is not selected at all');
+
+  -- And once the snooze elapses it becomes due at its snoozed time.
+  update public.reminders set snoozed_until = now() - interval '1 second' where id = v_snoozed;
+  select array_agg(d.id) into v_scan
+    from public.rpc_due_reminders(now(), 50) d;
+  perform public.test_assert(v_snoozed = any (v_scan),
+    'the snoozed reminder becomes due when its snooze elapses');
+end $$;
+
+-- 5Q. Recurring reminders advance only on success, in the user's timezone ----
+do $$
+declare
+  v_reminder uuid;
+  v_occ      timestamptz;
+  v_claim    jsonb;
+  v_res      jsonb;
+  v_next     timestamptz;
+  v_local_before text;
+  v_local_after  text;
+begin
+  insert into auth.users (id, email) values ('66666666-6666-4666-8666-666666666666', 'tz@example.test')
+  on conflict do nothing;
+  insert into public.profiles (id, full_name, email, role, timezone)
+  values ('66666666-6666-4666-8666-666666666666', 'TZ user', 'tz@example.test', 'admin', 'Asia/Kolkata')
+  on conflict (id) do update set timezone = 'Asia/Kolkata';
+
+  -- 09:00 local yesterday.
+  v_occ := (date_trunc('day', now() at time zone 'Asia/Kolkata') - interval '1 day' + interval '9 hours')
+             at time zone 'Asia/Kolkata';
+
+  insert into public.reminders (owner_id, title, remind_at, repeat)
+  values ('66666666-6666-4666-8666-666666666666', 'Daily standup', v_occ, 'daily')
+  returning id into v_reminder;
+
+  v_local_before := to_char(v_occ at time zone 'Asia/Kolkata', 'HH24:MI');
+
+  v_claim := public.rpc_claim_reminder(v_reminder, v_occ, 'w1', 300, 5);
+  v_res := public.rpc_complete_reminder_delivery(
+    v_reminder, v_occ, (v_claim ->> 'token')::uuid, true, null);
+
+  select remind_at into v_next from public.reminders where id = v_reminder;
+  v_local_after := to_char(v_next at time zone 'Asia/Kolkata', 'HH24:MI');
+
+  perform public.test_assert((v_res ->> 'advanced')::boolean,
+    'a successful recurring delivery advances the reminder');
+  perform public.test_assert(v_next > now(),
+    'the next occurrence is in the future, not a backlog replay');
+  perform public.test_assert(v_local_after = v_local_before,
+    'the local wall-clock time is preserved across the advance');
+  perform public.test_assert(
+    (select fired_at from public.reminders where id = v_reminder) is null,
+    'a recurring reminder is not marked finished after one occurrence');
+
+  -- repeat_until ends the series.
+  update public.reminders set repeat_until = current_date where id = v_reminder;
+  v_claim := public.rpc_claim_reminder(v_reminder, (select remind_at from public.reminders where id = v_reminder), 'w2', 300, 5);
+  v_res := public.rpc_complete_reminder_delivery(
+    v_reminder,
+    (select remind_at from public.reminders where id = v_reminder),
+    (v_claim ->> 'token')::uuid, true, null);
+  perform public.test_assert(v_res ->> 'reason' = 'series_finished',
+    'a recurrence past repeat_until finishes instead of rescheduling');
+  perform public.test_assert(
+    (select fired_at from public.reminders where id = v_reminder) is not null,
+    'the finished series is terminal');
+end $$;
+
+-- 5R. Notification preferences are honoured, and the default matches the docs -
+do $$
+declare
+  v_reminder uuid;
+  v_occ      timestamptz := now() + interval '30 minutes';
+  v_default  boolean;
+  v_explicit boolean;
+begin
+  insert into public.reminders (owner_id, title, remind_at)
+  values ('66666666-6666-4666-8666-666666666666', 'Preference default', v_occ)
+  returning id into v_reminder;
+
+  -- No preference row: the documented default is in-app only (no push).
+  select d.browser_notifications into v_default
+    from public.rpc_due_reminders(now() + interval '1 hour', 500) d
+   where d.id = v_reminder;
+  perform public.test_assert(v_default = false,
+    'a user with no preference row defaults to in-app only, as documented');
+
+  -- An explicit opt-in is reported as such.
+  insert into public.notification_preferences (user_id, browser_notifications)
+  values ('66666666-6666-4666-8666-666666666666', true)
+  on conflict (user_id) do update set browser_notifications = true;
+
+  select d.browser_notifications into v_explicit
+    from public.rpc_due_reminders(now() + interval '1 hour', 500) d
+   where d.id = v_reminder;
+  perform public.test_assert(v_explicit = true,
+    'an explicit browser_notifications = true is reported to the scheduler');
+
+  -- The scheduler also receives alarm_enabled so it can honour it.
+  perform public.test_assert(
+    (select d.alarm_enabled from public.rpc_due_reminders(now() + interval '1 hour', 500) d
+      where d.id = v_reminder) = true,
+    'alarm_enabled is carried to the scheduler');
 end $$;
 
 -- 5h. Internal notes upsert path (what the Supabase adapter actually sends) ---
@@ -964,6 +1296,177 @@ begin
     'the tripwire does not flag is_admin(), which only reads the role');
 
   drop function public.tmp_escalating_function(uuid);
+end $$;
+
+
+-- ===========================================================================
+-- 8. Function privileges (migration 0010)
+-- ===========================================================================
+reset role;
+select set_config('request.jwt.claim.sub', '', true);
+
+-- 8a. The helpers that were world-executable are now internal.
+do $$
+declare
+  v_names text[] := array[
+    'audit', 'next_document_number', 'sync_invoice_status',
+    'derive_invoice_status', 'assert_admin', 'access_attempts_exceeded'
+  ];
+  v_name text;
+  v_leak text;
+begin
+  foreach v_name in array v_names loop
+    perform public.test_assert(
+      not exists (
+        select 1 from pg_proc p
+          join pg_namespace n on n.oid = p.pronamespace
+         where n.nspname = 'public' and p.proname = v_name
+           and (has_function_privilege('anon', p.oid, 'execute')
+             or has_function_privilege('authenticated', p.oid, 'execute'))
+      ),
+      format('%s() is not executable by anon or authenticated', v_name));
+  end loop;
+
+  -- Nothing in public is world-executable any more.
+  select string_agg(p.proname, ', ') into v_leak
+    from pg_proc p
+    join pg_namespace n on n.oid = p.pronamespace
+   where n.nspname = 'public'
+     and p.prokind = 'f'
+     and p.proname <> 'test_assert'
+     and not exists (select 1 from pg_depend d where d.objid = p.oid and d.deptype = 'e')
+     and (has_function_privilege('anon', p.oid, 'execute')
+       or has_function_privilege('authenticated', p.oid, 'execute'))
+     and p.proname not in (
+       'is_admin', 'current_client_id', 'is_client_of',
+       'rpc_record_payment', 'rpc_void_payment', 'rpc_issue_receipt',
+       'rpc_refresh_invoice_status', 'rpc_attach_client_portal',
+       'rpc_change_client_access_code', 'rpc_revoke_client_access',
+       'rpc_reactivate_client_portal', 'rpc_set_admin_active',
+       'rpc_set_admin_code', 'rpc_set_client_code_expiry'
+     );
+  perform public.test_assert(v_leak is null,
+    format('no function outside the allowlist is API-executable (leaked: %s)', coalesce(v_leak, 'none')));
+
+  -- is_admin() must stay executable: RLS policies evaluate it as the caller.
+  perform public.test_assert(
+    has_function_privilege('authenticated', 'public.is_admin()', 'execute'),
+    'is_admin() remains executable by authenticated because RLS policies call it');
+
+  -- Nor may anything be executable by PUBLIC (which is how anon leaked before).
+  select string_agg(p.proname, ', ') into v_leak
+    from pg_proc p
+    join pg_namespace n on n.oid = p.pronamespace
+   where n.nspname = 'public'
+     and p.prokind = 'f'
+     and p.proname <> 'test_assert'
+     and not exists (select 1 from pg_depend d where d.objid = p.oid and d.deptype = 'e')
+     and (p.proacl is null or exists (select 1 from aclexplode(p.proacl) a where a.grantee = 0));
+  perform public.test_assert(v_leak is null,
+    format('no function in public keeps an implicit PUBLIC grant (leaked: %s)', coalesce(v_leak, 'none')));
+end $$;
+
+-- 8b. Default privileges: a function created later is not world-executable.
+do $$
+declare v_anon boolean; v_authn boolean;
+begin
+  create function public.privilege_drift_probe() returns integer language sql as 'select 1';
+  v_anon := has_function_privilege('anon', 'public.privilege_drift_probe()', 'execute');
+  v_authn := has_function_privilege('authenticated', 'public.privilege_drift_probe()', 'execute');
+  drop function public.privilege_drift_probe();
+
+  perform public.test_assert(not v_anon,
+    'a function created after 0010 is not executable by anon by default');
+  perform public.test_assert(not v_authn,
+    'a function created after 0010 is not executable by authenticated by default');
+end $$;
+
+-- 8c. Unauthorised callers cannot reach the audit trail, the number
+--     sequences or invoice status through the helper RPCs.
+--
+-- State is captured into a temp table *before* dropping to `authenticated`,
+-- because RLS would hide these rows from the client and every "before" and
+-- "after" read would then be 0 — a test that always passes.
+create temp table priv_snapshot (
+  inv          uuid,
+  seq_before   text,
+  audit_before integer,
+  status_before text
+) on commit drop;
+
+insert into priv_snapshot
+select (select id from public.invoices limit 1),
+       (select coalesce(sum(last_value), 0)::text from public.document_sequences where prefix like 'LD-RCP%'),
+       (select count(*) from public.audit_logs),
+       (select status::text from public.invoices limit 1);
+
+-- The snapshot table holds only fixture state, so the roles doing the probing
+-- may read it; the privilege checks below are what matters.
+grant select on priv_snapshot to authenticated, anon;
+
+-- The role switch has to happen outside the DO block: a block runs as whoever
+-- is current, and `set local role` inside plpgsql would not change the role the
+-- privilege checks are evaluated against.
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '22222222-2222-4222-8222-222222222222', true);
+
+do $$
+declare
+  v_inv uuid := (select inv from priv_snapshot);
+  v_blocked int := 0;
+begin
+  begin perform public.next_document_number('LD-RCP-'); exception when others then v_blocked := v_blocked + 1; end;
+  begin perform public.sync_invoice_status(v_inv); exception when others then v_blocked := v_blocked + 1; end;
+  begin perform public.audit('forged.action', 'profiles', null, null, '{}'::jsonb); exception when others then v_blocked := v_blocked + 1; end;
+  begin perform public.derive_invoice_status(v_inv); exception when others then v_blocked := v_blocked + 1; end;
+  begin perform public.assert_admin(); exception when others then v_blocked := v_blocked + 1; end;
+
+  perform public.test_assert(v_blocked = 5,
+    format('a signed-in client is refused all five internal helpers (refused %s of 5)', v_blocked));
+end $$;
+
+reset role;
+
+do $$
+declare
+  v_seq_after text;
+  v_audit_after int;
+  v_status_after text;
+  v_inv uuid := (select inv from priv_snapshot);
+begin
+  select coalesce(sum(last_value), 0)::text into v_seq_after
+    from public.document_sequences where prefix like 'LD-RCP%';
+  select count(*) into v_audit_after from public.audit_logs;
+  select status::text into v_status_after from public.invoices where id = v_inv;
+
+  perform public.test_assert(v_seq_after = (select seq_before from priv_snapshot),
+    'no document number was consumed by a refused caller');
+  perform public.test_assert(v_audit_after = (select audit_before from priv_snapshot),
+    'no audit row was forged by a refused caller');
+  perform public.test_assert(v_status_after = (select status_before from priv_snapshot),
+    'invoice status is unchanged after the refused calls');
+
+  perform public.test_assert(
+    not has_function_privilege('anon', 'public.next_document_number(text)', 'execute'),
+    'anon cannot even attempt to consume a document number');
+  perform public.test_assert(
+    not has_function_privilege('anon', 'public.audit(text, text, uuid, jsonb, jsonb)', 'execute'),
+    'anon cannot even attempt to write to the audit log');
+end $$;
+
+-- 8d. The allowlisted RPCs still work for an admin, i.e. the lockdown did not
+--     break the application.
+do $$
+declare v_before text; v_after text;
+begin
+  perform set_config('request.jwt.claim.sub', '11111111-1111-4111-8111-111111111111', true);
+  select coalesce(sum(last_value),0)::text into v_before from public.document_sequences where prefix like 'LD-RCP%';
+  select public.next_document_number('LD-RCP-') into v_after;
+  perform public.test_assert(v_after is not null and v_after like 'LD-RCP-%',
+    'an RPC can still draw a receipt number through its internal call');
+  perform public.test_assert(
+    (select coalesce(sum(last_value),0)::text from public.document_sequences where prefix like 'LD-RCP%') <> v_before,
+    'the sequence advanced for the trusted internal call');
 end $$;
 
 

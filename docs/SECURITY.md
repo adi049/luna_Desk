@@ -40,12 +40,33 @@ succeed. If the lookup code leaks, an attacker learns one address.
   target whose profile is not already an administrator (SQLSTATE `42501`),
   refuses client-linked profiles, refuses self-deactivation and refuses to
   remove the last active administrator, and it writes an `admin.deactivate` /
-  `admin.reactivate` audit row before and after the change.
+  `admin.reactivate` audit row before and after the change. The last-admin count
+  is taken under a transaction-scoped advisory lock (`0012`): without it two
+  administrators deactivating each other concurrently each counted the other as
+  the survivor and both commits went through, leaving the workspace with no
+  active administrator at all. `scripts/test-admin-concurrency.sh` drives two
+  real overlapping sessions and fails against the old definition.
 - **Admin bootstrap is not an API.** `rpc_promote_admin()` is executable by no
   role at all (not `anon`, not `authenticated`, not even `service_role`), so it
   can only be run from the SQL editor as the function owner. Migration 0009 also
   installs a tripwire that fails the migration if any future function assigns
   `role = 'admin'` outside the two reviewed ones.
+- **Every function has an explicit privilege decision** (`0010`). A function
+  created without a `REVOKE` inherits PostgreSQL's default: `EXECUTE` to
+  `PUBLIC`, and `PUBLIC` includes `anon`. Four `SECURITY DEFINER` helpers were
+  therefore callable with no session at all — `next_document_number()` (burned
+  receipt numbers), `sync_invoice_status()` (rewrote invoice status), `audit()`
+  (appended forged rows to the audit trail) and `derive_invoice_status()`.
+  `public.function_privilege_policy` now holds the allowlist as data;
+  `enforce_function_privileges()` revokes every grant from every non-extension
+  function in `public` and re-grants exactly what the table names. The same
+  policy is installed as `ALTER DEFAULT PRIVILEGES`, so a function added by a
+  future migration is closed until somebody deliberately opens it. Trigger
+  functions are unaffected: PostgreSQL does not check `EXECUTE` when it fires a
+  trigger, and internal calls are unaffected because each `rpc_*` is
+  `SECURITY DEFINER` and therefore checked as its owner.
+- **Administrator state changes are serialised.** See `rpc_set_admin_active()`
+  above and `scripts/test-admin-concurrency.sh`.
 - **Internal notes are a separate table.** `public.internal_notes` has no client
   policy at all, because RLS filters rows, not columns — an `internal_notes`
   column on `clients` would be readable by the client whose row it describes.
