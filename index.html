@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>LunaDesk — Managed by Luna</title>
+    <meta name="description" content="LunaDesk is the private client and agency workspace for Managed by Luna: projects, services, billing, receipts and your own productivity tools." />
+    <meta name="theme-color" content="#09090D" />
+    <meta name="color-scheme" content="dark light" />
+    <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+    <link rel="apple-touch-icon" href="./apple-touch-icon.svg" />
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <style>
+      /* Paint the brand background before React mounts to avoid a white flash. */
+      html, body { background: #09090D; }
+      html[data-theme='light'], html[data-theme='light'] body { background: #F4F4F9; }
+      #boot { min-height: 100dvh; display: grid; place-items: center; }
+      #boot span { width: 26px; height: 26px; border-radius: 999px; border: 2px solid rgba(199,203,212,.25); border-top-color: #FF2D95; animation: spin .8s linear infinite; }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      @media (prefers-reduced-motion: reduce) { #boot span { animation: none; } }
+    </style>
+  </head>
+  <body>
+    <div id="root"><div id="boot"><span aria-hidden="true"></span></div></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

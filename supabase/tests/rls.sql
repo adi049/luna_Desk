@@ -1,0 +1,385 @@
+-- =============================================================================
+-- LunaDesk — RLS & RPC test suite
+--
+-- Plain-SQL asserts (no pgTAP needed). Every test runs inside one transaction
+-- that is rolled back, so it is safe to point at a scratch database.
+--
+--   psql -v ON_ERROR_STOP=1 -d lunadesk_test -f supabase/tests/rls.sql
+--
+-- The suite impersonates users the same way PostgREST does: SET ROLE
+-- authenticated + request.jwt.claim.sub.
+-- =============================================================================
+
+\set ON_ERROR_STOP on
+\pset pager off
+
+create or replace function public.test_assert(p_ok boolean, p_label text)
+returns void language plpgsql as $$
+begin
+  if p_ok is not true then
+    raise exception 'FAIL: %', p_label;
+  end if;
+  raise notice 'ok — %', p_label;
+end $$;
+
+begin;
+
+-- ---------------------------------------------------------------------------
+-- Fixtures
+-- ---------------------------------------------------------------------------
+do $$
+declare
+  v_admin uuid := '11111111-1111-4111-8111-111111111111';
+  v_ua    uuid := '22222222-2222-4222-8222-222222222222';
+  v_ub    uuid := '33333333-3333-4333-8333-333333333333';
+  v_ca    uuid := 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  v_cb    uuid := 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  v_svc   uuid := 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+  v_inv_a uuid := 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+  v_inv_b uuid := 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+  v_task  uuid;
+begin
+  insert into auth.users (id, email) values
+    (v_admin, 'admin@example.test'),
+    (v_ua,    'a@example.test'),
+    (v_ub,    'b@example.test');
+
+  update public.profiles set role = 'admin', full_name = 'Studio Admin' where id = v_admin;
+
+  insert into public.clients (id, name, business_name, client_code, email, status, portal_status)
+  values (v_ca, 'Priya', 'Prism Studio LLP', 'PR103', 'priya@example.test', 'active', 'active'),
+         (v_cb, 'Ananya', 'Ansel & Co.',   'ANS005', 'ananya@example.test', 'active', 'active');
+
+  update public.profiles set role = 'client', client_id = v_ca where id = v_ua;
+  update public.profiles set role = 'client', client_id = v_cb where id = v_ub;
+
+  insert into public.services (id, name, category) values (v_svc, 'Social Media Marketing', 'Marketing');
+
+  insert into public.invoices (id, invoice_number, client_id, issue_date, due_date, subtotal_minor, total_minor, status)
+  values (v_inv_a, 'TEST-INV-0001', v_ca, current_date - 40, current_date + 10, 500000, 500000, 'pending'),
+         (v_inv_b, 'TEST-INV-0002', v_cb, current_date - 5, current_date + 10, 900000, 900000, 'pending');
+
+  insert into public.invoice_items (invoice_id, description, quantity, unit_price_minor, amount_minor)
+  values (v_inv_a, 'Social retainer — October 2026', 1, 500000, 500000),
+         (v_inv_b, 'Brand campaign', 1, 900000, 900000);
+
+  insert into public.internal_notes (client_id, body) values (v_ca, 'Prefers WhatsApp approvals.');
+
+  -- Client-visible and internal events for client A.
+  insert into public.calendar_events (owner_id, client_id, title, starts_at, ends_at, client_visible)
+  values (v_admin, v_ca, 'Monthly review call', now() + interval '2 days', now() + interval '2 days 1 hour', true),
+         (v_admin, v_ca, 'Internal margin review', now() + interval '3 days', now() + interval '3 days 1 hour', false);
+
+  insert into public.tasks (owner_id, title, status) values (v_admin, 'Admin private task', 'todo')
+  returning id into v_task;
+
+  insert into public.tasks (owner_id, title, status) values (v_ua, 'Client A private task', 'todo');
+
+  -- Portal identity for client A.
+  perform set_config('request.jwt.claim.sub', v_admin::text, true);
+  perform public.rpc_attach_client_portal(v_ca, v_ua, 'PR103', 'Portal access');
+end $$;
+
+-- ---------------------------------------------------------------------------
+-- 1. Client isolation
+-- ---------------------------------------------------------------------------
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '22222222-2222-4222-8222-222222222222', true);
+
+select public.test_assert(
+  (select count(*) from public.clients) = 1, 'client sees exactly one client row (their own)');
+select public.test_assert(
+  (select business_name from public.clients) = 'Prism Studio LLP', 'that row is their business');
+select public.test_assert(
+  (select count(*) from public.invoices) = 1, 'client sees only their own invoice');
+select public.test_assert(
+  (select count(*) from public.payments where client_id = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb') = 0,
+  'client cannot see another tenant''s payments');
+
+select public.test_assert(
+  (select count(*) from public.internal_notes) = 0, 'internal notes are invisible to clients');
+
+select public.test_assert(
+  (select count(*) from public.tasks) = 1 and (select title from public.tasks) = 'Client A private task',
+  'personal tasks are owner-scoped, not role-scoped');
+
+select public.test_assert(
+  (select count(*) from public.calendar_events) = 1
+  and (select title from public.calendar_events) = 'Monthly review call',
+  'client sees only client_visible events');
+
+select public.test_assert(
+  (select count(*) from public.client_access_codes) = 0, 'clients cannot read access-code hashes');
+
+-- Writes must be refused.
+do $$
+declare v_blocked boolean := false;
+begin
+  begin
+    insert into public.clients (name, business_name, client_code)
+    values ('Fake', 'Fake Co', 'FAKE1');
+  exception when insufficient_privilege then v_blocked := true;
+  end;
+  perform public.test_assert(v_blocked, 'client cannot insert a client row');
+end $$;
+
+do $$
+declare v_blocked boolean := false;
+begin
+  begin
+    update public.profiles set role = 'admin'
+    where id = '22222222-2222-4222-8222-222222222222';
+  exception when others then v_blocked := true;
+  end;
+  perform public.test_assert(v_blocked, 'client cannot escalate their own role');
+end $$;
+
+do $$
+declare v_blocked boolean := false;
+begin
+  begin
+    perform public.rpc_record_payment(
+      'dddddddd-dddd-4ddd-8ddd-dddddddddddd', 1000, current_date, 'upi');
+  exception when others then v_blocked := true;
+  end;
+  perform public.test_assert(v_blocked, 'client cannot record a payment');
+end $$;
+
+-- ---------------------------------------------------------------------------
+-- 2. Admin financial flows
+-- ---------------------------------------------------------------------------
+reset role;
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '11111111-1111-4111-8111-111111111111', true);
+
+select public.test_assert((select count(*) from public.clients) = 2, 'admin sees every client');
+
+-- Partial payment: Oct 2026 billed 5,000 / received 3,000 / outstanding 2,000.
+select public.rpc_record_payment('dddddddd-dddd-4ddd-8ddd-dddddddddddd', 300000, current_date, 'upi', 'UPI-9931');
+
+select public.test_assert(
+  (select status from public.invoices where id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd') = 'partially_paid',
+  'partial payment marks the invoice partially_paid');
+select public.test_assert(
+  (select balance_minor from public.invoice_balances where invoice_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd') = 200000,
+  'outstanding is per period (₹2,000), not lifetime');
+
+-- Overdue takes precedence once the due date has passed (matching the UI).
+do $$
+begin
+  update public.invoices set due_date = current_date - 1
+  where id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+  perform public.test_assert(
+    (select status from public.invoices where id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd') = 'partially_paid',
+    'stored status is recomputed by the payment trigger, not by the date');
+  perform public.test_assert(
+    (select effective_status from public.invoice_balances
+      where invoice_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd') = 'overdue',
+    'a past-due part-paid invoice reads as overdue but keeps its balance');
+  update public.invoices set due_date = current_date + 10
+  where id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+end $$;
+
+-- Overpayment is impossible.
+do $$
+declare v_blocked boolean := false;
+begin
+  begin
+    perform public.rpc_record_payment('dddddddd-dddd-4ddd-8ddd-dddddddddddd', 250000, current_date, 'upi');
+  exception when others then v_blocked := true;
+  end;
+  perform public.test_assert(v_blocked, 'a payment cannot exceed the outstanding balance');
+end $$;
+
+-- Second payment settles it.
+select public.rpc_record_payment('dddddddd-dddd-4ddd-8ddd-dddddddddddd', 200000, current_date, 'bank_transfer', 'NEFT-7734');
+select public.test_assert(
+  (select status from public.invoices where id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd') = 'paid',
+  'invoice flips to paid when fully settled');
+
+-- Receipts: unique numbering, one per payment, snapshot frozen.
+select public.rpc_issue_receipt(
+  (select id from public.payments
+    where invoice_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd' and amount_minor = 300000), null);
+
+select public.test_assert(
+  (select receipt_number from public.receipts limit 1) like 'MBL-RCP-%',
+  'receipt numbering follows the configured prefix');
+
+select public.test_assert(
+  (select (snapshot ->> 'previous_minor')::bigint from public.receipts limit 1) = 0
+  and (select (snapshot ->> 'balance_minor')::bigint from public.receipts limit 1) = 200000,
+  'first receipt snapshot: paid 3,000 against a 5,000 invoice → 2,000 remaining');
+
+do $$
+declare v_blocked boolean := false;
+begin
+  begin
+    perform public.rpc_issue_receipt(
+      (select id from public.payments
+        where invoice_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd' and amount_minor = 300000), null);
+  exception when others then v_blocked := true;
+  end;
+  perform public.test_assert(v_blocked, 'a payment cannot be receipted twice');
+end $$;
+
+-- Snapshot is immutable in spirit: the second receipt must reflect payment 1.
+select public.rpc_issue_receipt(
+  (select id from public.payments
+    where invoice_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd' and amount_minor = 200000), 'Settled in full');
+select public.test_assert(
+  (select (snapshot ->> 'previous_minor')::bigint from public.receipts order by receipt_number desc limit 1) = 300000,
+  'later receipt records previous payments instead of restating the total');
+
+select public.test_assert(
+  (select count(distinct receipt_number) from public.receipts) = (select count(*) from public.receipts),
+  'receipt numbers are unique');
+
+-- Voiding a payment keeps history and reverts the invoice.
+select public.rpc_void_payment(
+  (select id from public.payments
+    where invoice_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd' and amount_minor = 200000),
+  'Bounced cheque');
+
+select public.test_assert(
+  (select status from public.invoices where id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd') = 'partially_paid',
+  'voiding the settling payment returns the invoice to partially_paid');
+select public.test_assert(
+  (select count(*) from public.payments where invoice_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd') = 2,
+  'voided payments are retained, never deleted');
+select public.test_assert(
+  (select count(*) from public.receipts where voided_at is not null) = 1,
+  'the receipt of a voided payment is marked void, not removed');
+
+-- Invoice totals must agree with their items.
+do $$
+declare v_blocked boolean := false;
+begin
+  begin
+    update public.invoices set subtotal_minor = 1, total_minor = 1
+    where id = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+  exception when others then v_blocked := true;
+  end;
+  perform public.test_assert(v_blocked, 'an invoice total cannot drift from its line items');
+end $$;
+
+-- A client with money outstanding cannot be archived.
+do $$
+declare v_blocked boolean := false;
+begin
+  begin
+    update public.clients set status = 'archived'
+    where id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  exception when others then v_blocked := true;
+  end;
+  perform public.test_assert(v_blocked, 'archive guard rejects a client with outstanding invoices');
+end $$;
+
+select public.test_assert(
+  (select count(*) from public.internal_notes) = 1, 'admin can read internal notes');
+
+select public.test_assert(
+  (select count(*) from public.tasks) = 1, 'admin cannot read another user''s personal tasks');
+
+select public.test_assert(
+  (select count(*) from public.audit_logs) > 0, 'financial actions are written to the audit log');
+
+-- ---------------------------------------------------------------------------
+-- 3. Access codes: verification, rate limiting, revocation
+-- ---------------------------------------------------------------------------
+reset role;
+
+select public.test_assert(
+  (public.rpc_redeem_access_code('PR103', '10.0.0.1'::inet, 'test')) ->> 'ok' = 'true',
+  'a valid portal code resolves to a session identity');
+select public.test_assert(
+  (public.rpc_redeem_access_code('PR103', '10.0.0.1'::inet, 'test')) ->> 'business_name' = 'Prism Studio LLP',
+  'the resolved identity belongs to the right tenant');
+select public.test_assert(
+  (public.rpc_redeem_access_code('WRONG1', '10.0.0.2'::inet, 'test')) ->> 'error' = 'invalid_code',
+  'a wrong code is rejected');
+select public.test_assert(
+  (select code_hash from public.client_access_codes limit 1) !~ 'PR103',
+  'codes are stored hashed, never in plain text');
+
+-- Eight bad attempts trigger the limiter.
+do $$
+declare i int; v_res jsonb;
+begin
+  for i in 1..9 loop
+    v_res := public.rpc_redeem_access_code('BAD' || i, '10.9.9.9'::inet, 'test');
+  end loop;
+  perform public.test_assert(v_res ->> 'error' = 'rate_limited', 'repeated bad attempts are rate limited');
+end $$;
+
+select public.rpc_revoke_client_access('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'Contract ended');
+
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '22222222-2222-4222-8222-222222222222', true);
+select public.test_assert(
+  (select count(*) from public.clients) = 0, 'a revoked portal session loses all row access');
+select public.test_assert(public.current_client_id() is null, 'current_client_id() returns null once revoked');
+
+reset role;
+-- A revoked code is indistinguishable from a wrong one: no tenant enumeration.
+select public.test_assert(
+  (public.rpc_redeem_access_code('PR103', '10.0.0.3'::inet, 'test')) ->> 'error' = 'invalid_code',
+  'a revoked code no longer authenticates anyone');
+
+-- A valid code for a client the agency has deactivated is refused explicitly.
+do $$
+declare v_disabled text;
+begin
+  insert into public.clients (id, name, business_name, client_code, status, portal_status)
+  values ('ffffffff-ffff-4fff-8fff-ffffffffffff', 'Vikram', 'Vellum Legal', 'VEL009', 'inactive', 'active');
+  insert into public.client_access_codes (client_id, code_hash)
+  values ('ffffffff-ffff-4fff-8fff-ffffffffffff', extensions.crypt('VEL009', extensions.gen_salt('bf', 10)));
+  v_disabled := public.rpc_redeem_access_code('VEL009', '10.0.0.4'::inet, 'test') ->> 'error';
+  perform public.test_assert(v_disabled = 'access_disabled',
+    'a deactivated client''s code is refused with access_disabled');
+end $$;
+
+-- ---------------------------------------------------------------------------
+-- 4. Admin lookup codes identify, they never authenticate
+-- ---------------------------------------------------------------------------
+select set_config('request.jwt.claim.sub', '11111111-1111-4111-8111-111111111111', true);
+select public.rpc_set_admin_code('admin@example.test', 'ADI000');
+select set_config('request.jwt.claim.sub', '', true);
+
+select public.test_assert(
+  (public.rpc_lookup_admin_code('ADI000', '10.0.0.5'::inet, 'test')) ->> 'email' = 'admin@example.test',
+  'the admin code resolves to the staff account');
+select public.test_assert(
+  (public.rpc_lookup_admin_code('ADI000', '10.0.0.5'::inet, 'test')) ->> 'ok' = 'true'
+  and (select jsonb_object_keys_count from (select count(*) as jsonb_object_keys_count
+        from jsonb_object_keys(public.rpc_lookup_admin_code('ADI000', '10.0.0.5'::inet, 'test'))
+        where jsonb_object_keys like '%password%') k) = 0,
+  'the lookup returns identity only — no credential, no session');
+select public.test_assert(
+  (public.rpc_lookup_admin_code('ADI999', '10.0.0.6'::inet, 'test')) ->> 'error' = 'invalid_code',
+  'a wrong admin code is rejected');
+select public.test_assert(
+  (select count(*) from public.access_attempts where outcome = 'admin_lookup') >= 2,
+  'admin lookups are recorded in the attempt ledger');
+select public.test_assert(
+  (select count(*) from public.admin_access_codes where code_hash like '%ADI000%') = 0,
+  'admin codes are stored hashed');
+
+-- Clients still cannot call the lookup RPC (service role only).
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '22222222-2222-4222-8222-222222222222', true);
+do $$
+declare v_blocked boolean := false;
+begin
+  begin
+    perform public.rpc_lookup_admin_code('ADI000', null, 'test');
+  exception when insufficient_privilege or others then v_blocked := true;
+  end;
+  perform public.test_assert(v_blocked, 'the admin lookup RPC is not executable by clients');
+end $$;
+reset role;
+
+rollback;
+
+drop function if exists public.test_assert(boolean, text);
+\echo 'ALL TESTS PASSED'

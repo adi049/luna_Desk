@@ -1,0 +1,13 @@
+{
+  "name": "LunaDesk — Managed by Luna",
+  "short_name": "LunaDesk",
+  "description": "Private client and agency workspace for Managed by Luna.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#09090D",
+  "theme_color": "#09090D",
+  "icons": [
+    { "src": "./favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}
