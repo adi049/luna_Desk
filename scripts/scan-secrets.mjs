@@ -12,10 +12,31 @@
  * itself — only the file, line and a redacted hint.
  */
 import { execSync } from 'node:child_process';
-import { readFileSync, statSync } from 'node:fs';
-import { extname } from 'node:path';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { extname, join } from 'node:path';
 
 const history = process.argv.includes('--history');
+
+/** True when the working directory is inside a git repository. */
+function inGitRepo() {
+  try {
+    execSync('git rev-parse --is-inside-work-tree', { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Fallback file listing for an extracted archive (the ZIP ships no .git). */
+function walk(dir, acc = []) {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (['node_modules', 'dist', 'coverage', '.git'].includes(entry.name)) continue;
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) walk(full, acc);
+    else acc.push(full.replace(/^\.\//, ''));
+  }
+  return acc;
+}
 
 const SKIP_EXT = new Set([
   '.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.pdf', '.zip',
@@ -58,6 +79,13 @@ function scanText(label, text) {
   });
 }
 
+const useGit = inGitRepo();
+
+if (history && !useGit) {
+  console.error('--history needs a git repository; the extracted archive has no history to scan.');
+  process.exit(1);
+}
+
 if (history) {
   // Every blob ever committed, so a secret removed in a later commit is caught.
   const files = execSync('git rev-list --objects --all', { encoding: 'utf8' })
@@ -76,7 +104,9 @@ if (history) {
     scanText(`history:${path}`, text);
   }
 } else {
-  const files = execSync('git ls-files', { encoding: 'utf8' }).split('\n').filter(Boolean);
+  const files = useGit
+    ? execSync('git ls-files', { encoding: 'utf8' }).split('\n').filter(Boolean)
+    : walk('.');
   for (const path of files) {
     if (SKIP_PATH.test(path) || SKIP_EXT.has(extname(path))) continue;
     try {
@@ -98,5 +128,7 @@ if (findings.length) {
 console.log(
   history
     ? '✓ No credential-shaped strings in any committed blob.'
-    : '✓ No credential-shaped strings in tracked files.',
+    : useGit
+      ? '✓ No credential-shaped strings in tracked files.'
+      : '✓ No credential-shaped strings in the working tree (no git repo found; scanned files directly).',
 );
