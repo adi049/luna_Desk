@@ -1,7 +1,8 @@
 # Pre-Supabase audit — LunaDesk
 
-Date: 2026-10-23
-Scope: the repository as committed at `e52067e`, hardened locally.
+Date: 2026-10-23, extended 2026-10-24
+Scope: the repository as committed at `0e38f7d`, hardened locally in two rounds
+(§9 is the second round).
 **No live Supabase project was contacted, created or modified.** Every database
 result below comes from a local PostgreSQL 17 instance running the migrations in
 `supabase/migrations/`.
@@ -413,3 +414,160 @@ to, a real Supabase project. The honest statement is:
 
 The hard blocker that would have made a first deployment fail outright — the RPC
 name mismatch — is fixed and now guarded by an automated check.
+
+---
+
+# 9. Second hardening round (2026-10-24)
+
+Six defects reported after the first round were reproduced, fixed and — where
+possible — proven by a test that fails without the fix. Reproductions used a
+throwaway database and were deleted afterwards.
+
+## 9.1 Privilege escalation through `rpc_set_admin_active`
+
+**Reproduced.** A signed-in user whose profile said `role = 'client'` called
+`rpc_set_admin_active(<own id>, true)` and came out as an administrator with a
+`user_roles` grant. The function's body was
+`set is_active = p_active, role = 'admin'`, so the "activation" toggle was a
+promotion primitive available to every authenticated session, and it also
+rewrote `role` on accounts that were already admins.
+
+**Fixed** (`0008_code_and_reminder_hardening.sql`). The function now
+`assert_admin()`s the caller, then requires the *target* to already be an
+`admin` (`42501`), to have no `client_id` (`42501`), refuses self-deactivation
+and last-active-admin deactivation (`P0001`), returns
+`{ok, changed, is_active}` instead of being void, and writes an audit row with
+`role_before`/`role_after`/`is_active`. It never writes `role`.
+
+**Proven.** Five new test blocks in `supabase/tests/rls.sql` §6 (client and
+ordinary users cannot be promoted; role unchanged and no grant created by a
+refused call; a real admin is toggled with the role preserved and the grant
+restored on reactivation; the workspace always keeps an active admin; a client
+session cannot call the function at all). A **mutation test** re-introduced the
+old body and the suite failed with
+`FAIL: an ordinary user cannot be promoted to admin through rpc_set_admin_active`.
+
+One honest note: the count-based "last admin" guard is currently unreachable,
+because a caller who is an active admin and a target who is the *only* active
+admin must be the same row, so the self-deactivation guard fires first. It is
+kept as a defensive second gate, and the test asserts the reachable path by its
+message rather than pretending to exercise dead code.
+
+## 9.2 Reminder occurrences could become permanently unclaimable
+
+**Reproduced.** After a simulated worker crash between claim and outcome,
+`rpc_claim_reminder` returned `first = t, after_crash = f, later = f` on a
+single row: the claim row existed, no outcome was ever recorded, and nothing
+could ever reclaim it. The reminder silently never rang again.
+
+**Fixed.** The claim is now a lease: `reminder_deliveries` gained `attempts`,
+`lease_expires_at`, `last_attempt_at` and `finished_at`, and
+`rpc_claim_reminder(uuid, timestamptz, text, integer lease_seconds, integer
+max_attempts)` returns `{claimed, attempt, reason}` with `reason` one of `new`,
+`already_delivered`, `lease_active`, `lease_expired`, `attempts_exhausted`.
+`rpc_mark_reminder_delivery(…, p_retry_after_seconds)` releases the lease on
+failure with a backoff. Delivered occurrences are terminal; exhausted ones are
+abandoned visibly. The prune keeps undelivered rows inside their attempt budget.
+
+**Also fixed in the caller.** `supabase/functions/send-reminders/index.ts`
+compared the claim result to `true`; with the jsonb return that comparison is
+always false, so *every* reminder would have been silently skipped. It now
+parses the result (`normaliseClaim`, which still accepts the old boolean so a
+stale deployment cannot be read as truthy) and passes lease/attempt/backoff
+parameters.
+
+**Proven.** `supabase/tests/rls.sql` §5h–5k: crash recovery, bounded attempts,
+delivered-is-terminal, and a recorded failure handing the occurrence back for an
+immediate retry.
+
+## 9.3 The migration verifier could pass on a broken migration
+
+**Reproduced.** A migration containing a syntax error printed the psql error and
+then `✓ schema verified`, exit **0** — `psql … | grep … || true` discarded both
+the exit status and the error text.
+
+**Fixed.** `scripts/verify-migrations.sh` was rewritten: every SQL step runs
+through `run_sql_file`, which captures output to a temp file and exits non-zero
+with the psql text preserved; the suite must print `ALL TESTS PASSED` or the run
+fails; `MIGRATIONS_DIR` allows a different tree.
+
+**Proven** by a new meta-test, `scripts/test-verify-migrations.sh` (13
+assertions, `npm run test:verifier`), which checks that the verifier exits 1 for
+a syntax error, for a failing assertion, for a suite that stops before the end,
+and for an empty migrations directory — **and** exits 0 on an unmodified tree,
+so a verifier that simply always fails does not pass the meta-test either.
+
+## 9.4 Live builds accepted `.env.example` placeholders
+
+**Found while fixing the duplicate `VITE_DATA_MODE` documentation** (the file
+set `VITE_DATA_MODE=live` at line 11 and then re-explained the build guard at
+lines 45–50, with no single source of truth).
+
+The build guard only checked that the variables were non-empty. Copying
+`.env.example` unchanged gives `https://YOUR-PROJECT.supabase.co` and
+`your-anon-publishable-key`, which are non-empty — so the "safety" guard would
+happily publish a live bundle pointing at a project that does not exist.
+
+**Fixed.** `.env.example` is rewritten with one section per setting and a single
+statement of the build rules. `vite.config.ts` now rejects placeholder values,
+keys too short to be a publishable key, and any URL that is not `https`
+(localhost/127.0.0.1 excepted), and reports every problem at once.
+
+**Verified** by building with the placeholder values (fails, naming both
+variables), with an `http://` URL (fails), and with realistic values in both
+live and demo mode (both succeed).
+
+## 9.5 Administrator sign-in ignored the reason a lookup failed
+
+`signInWithAccessCode` unwrapped the Edge Function's error body, but
+`signInAdminWithCode` replaced every failure with "Administrator code
+verification failed" and dropped `retry_after`, so a rate-limited administrator
+was told their code was wrong and retried immediately, extending the lockout.
+Both paths now share one `invokeFunction` helper, and `LoginPage` passes
+`retryAfterSeconds` through so the existing lockout countdown applies.
+
+## 9.6 `rpc_promote_admin` was an unaudited admin factory
+
+The function mints an administrator from an email address, wrote no audit row,
+and was granted to `service_role` — reachable at `/rest/v1/rpc/rpc_promote_admin`
+by anything holding the service key. Nothing in the app or the scripts calls it
+(`scripts/bootstrap-admin.sql` does the same work inline), so it was pure
+downside.
+
+**Fixed** (`0009_admin_bootstrap_lockdown.sql`): the function is still available
+for the documented SQL-editor bootstrap, but its execute grant is removed from
+`public`, `anon`, `authenticated` **and** `service_role`, it validates the email,
+and it writes an `admin.promote` audit row. The migration also installs a
+tripwire that fails if any other function assigns `role = 'admin'`.
+
+**Proven** by `supabase/tests/rls.sql` §7: `has_function_privilege` is false for
+all three roles, and the tripwire query is asserted to flag a planted escalating
+function while not flagging `is_admin()`.
+
+## 9.7 Checks actually run in this round
+
+| Command | Result |
+| --- | --- |
+| `npx tsc --noEmit` | pass, no output |
+| `npm run check:rpc` | pass — 35 functions parsed, 7 bridged calls matched |
+| `npm run check:secrets` | pass |
+| `npm run check:secrets:history` | pass — no credential-shaped strings in any committed blob |
+| `npm run verify:db` (local PostgreSQL 17) | pass — **9 migrations, 110 assertions**, `ALL TESTS PASSED` |
+| `npm run test:verifier` | pass — 13/13 |
+| `CI=true VITE_DATA_MODE=demo npx vite build` | pass |
+| `CI=true VITE_DATA_MODE=live … npx vite build` | pass with realistic values; fails on placeholders and on `http://` |
+| mutation: old `rpc_set_admin_active` restored | suite fails as intended |
+
+Not run, and why: nothing in this round required a live Supabase project, and
+none was contacted. Everything in §7 of the first audit still stands
+(PostgREST `on_conflict`, `pg_cron`, real CORS, storage policies, real push
+delivery, real DST boundaries).
+
+## 9.8 Production readiness
+
+**Still not claimed.** These fixes remove real security and reliability defects
+and every offline check passes, but the application has still never
+authenticated against, written to, or been deployed with a real Supabase
+project. The Edge Functions have not been executed on Supabase's runtime; the
+SQL has only run on stock PostgreSQL 17 with an `auth` shim. Treat the code as
+ready for a staging deployment, not as production-proven.

@@ -81,6 +81,26 @@ it pushes. A claim that fails to deliver is recorded with its error
 (`rpc_mark_reminder_delivery`) rather than being retried invisibly, so a broken
 push subscription is visible instead of silently re-firing.
 
+The claim is a **lease, not a permanent lock**. An earlier version wrote the
+claim row and never released it, so a worker that died between claiming and
+recording the outcome left that occurrence permanently unclaimable — the
+reminder simply never rang again. Now:
+
+- the claim carries `lease_expires_at` (default 300 s) and `attempts`;
+- a crash blocks delivery for at most the lease, after which another run may
+  retry the occurrence (`reason = 'lease_expired'`);
+- a recorded failure releases the lease immediately with a linear backoff
+  (60 s × attempt) so a flapping device is not hammered;
+- attempts are capped (default 5). A delivered occurrence is terminal; an
+  exhausted one is abandoned with `reason = 'attempts_exhausted'` and logged,
+  rather than retried forever;
+- the daily prune deletes settled claims but keeps undelivered ones that are
+  still inside their attempt budget, so recovery survives housekeeping.
+
+`send-reminders` accepts both the current jsonb claim result and the older
+boolean return, so a stale deployment cannot be read as "claimed" and
+double-send.
+
 In the browser, `ReminderWatcher` keys its in-flight set on
 `reminder.id + occurrence`, so the same occurrence cannot ring twice while a
 repeating reminder can still ring again tomorrow.

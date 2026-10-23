@@ -105,7 +105,9 @@ export default function LoginPage() {
     setFormError(null);
     try {
       const result = await signInAdminWithCode(code, password);
-      if (!result.ok) handleResult(false, result.error);
+      // Pass the lockout window through: a rate-limited administrator must be
+      // told how long to wait, not just that the code was rejected.
+      if (!result.ok) handleResult(false, result.error, result.retryAfterSeconds);
     } catch {
       handleResult(false, 'Administrator sign-in is unavailable right now.');
     } finally {

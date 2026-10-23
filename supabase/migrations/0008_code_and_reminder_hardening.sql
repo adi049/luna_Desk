@@ -212,72 +212,189 @@ grant execute on function public.rpc_lookup_admin_code(text, inet, text) to serv
 -- ----------------------------------------------------------------------------
 -- Reminder delivery claims
 --
--- Delivery is at-least-once unless it is claimed first. The unique key
--- (reminder_id, occurrence) is the mutex: exactly one caller can insert it, and
--- only that caller sends the push. The row also records the outcome so a
--- failed push is visible and retryable instead of silently lost.
+-- Exactly one worker may act on a given (reminder, occurrence). The unique key
+-- is the mutex, but a mutex alone is not enough: a worker can die after taking
+-- the claim and before recording an outcome, which previously left that
+-- occurrence unclaimable forever. The claim is therefore a *lease*.
+--
+-- Semantics:
+--   * a claim carries `lease_expires_at` and an `attempts` counter;
+--   * a live lease blocks everyone else — this is the duplicate-delivery
+--     protection, and it is unchanged for the happy path;
+--   * an expired lease may be reclaimed, but only while attempts remain, so a
+--     poisoned occurrence retries a bounded number of times and then stops;
+--   * a delivered occurrence is terminal and is never reclaimed.
+--
+-- Trade-off, stated plainly: if a worker pushes successfully and then crashes
+-- before marking delivery, the lease expires and the occurrence can be pushed
+-- once more. That is at-least-once delivery for the rare crash window, which is
+-- the correct choice for a reminder (a duplicate notification is far less
+-- harmful than a silently dropped one). The attempts cap bounds how often it
+-- can happen, and the push payload reuses a stable `tag`, so the OS collapses
+-- repeats into one notification on the device.
 -- ----------------------------------------------------------------------------
 create table if not exists public.reminder_deliveries (
-  id          uuid primary key default gen_random_uuid(),
-  reminder_id uuid not null references public.reminders (id) on delete cascade,
-  occurrence  timestamptz not null,
-  worker      text,
-  claimed_at  timestamptz not null default now(),
-  delivered   boolean not null default false,
-  error       text,
+  id               uuid primary key default gen_random_uuid(),
+  reminder_id      uuid not null references public.reminders (id) on delete cascade,
+  occurrence       timestamptz not null,
+  worker           text,
+  claimed_at       timestamptz not null default now(),
+  attempts         integer not null default 1 check (attempts > 0),
+  lease_expires_at timestamptz,
+  last_attempt_at  timestamptz not null default now(),
+  delivered        boolean not null default false,
+  error            text,
+  finished_at      timestamptz,
   unique (reminder_id, occurrence)
 );
+
+-- Upgrade path for a database that already ran the earlier version of this
+-- migration (the table was created without lease columns).
+alter table public.reminder_deliveries add column if not exists attempts integer not null default 1;
+alter table public.reminder_deliveries add column if not exists lease_expires_at timestamptz;
+alter table public.reminder_deliveries add column if not exists last_attempt_at timestamptz not null default now();
+alter table public.reminder_deliveries add column if not exists finished_at timestamptz;
+
 create index if not exists reminder_deliveries_recent_idx
   on public.reminder_deliveries (claimed_at desc);
+-- Supports the recovery scan without walking the whole table.
+create index if not exists reminder_deliveries_lease_idx
+  on public.reminder_deliveries (lease_expires_at)
+  where not delivered;
 
 alter table public.reminder_deliveries enable row level security;
 -- No policies: only SECURITY DEFINER functions and the service role touch it.
 
 revoke all on public.reminder_deliveries from anon, authenticated;
 
--- Returns true only for the caller that wins the claim.
+-- Claim (or reclaim) one occurrence.
+--
+-- Returns jsonb rather than boolean so a caller can tell "somebody else is
+-- working on it" from "this is poisoned and has given up". The old boolean
+-- signature is dropped first.
+drop function if exists public.rpc_claim_reminder(uuid, timestamptz, text);
+
 create or replace function public.rpc_claim_reminder(
-  p_reminder_id uuid,
-  p_occurrence  timestamptz,
-  p_worker      text default 'scheduler'
+  p_reminder_id   uuid,
+  p_occurrence    timestamptz,
+  p_worker        text default 'scheduler',
+  p_lease_seconds integer default 300,
+  p_max_attempts  integer default 5
 )
-returns boolean
+returns jsonb
 language plpgsql
 security definer
 set search_path = public
 as $$
-declare v_rows integer;
+declare
+  v_row     public.reminder_deliveries%rowtype;
+  v_attempt integer;
 begin
-  insert into public.reminder_deliveries (reminder_id, occurrence, worker)
-  values (p_reminder_id, p_occurrence, p_worker)
-  on conflict (reminder_id, occurrence) do nothing;
+  if p_reminder_id is null or p_occurrence is null then
+    raise exception 'A reminder id and occurrence are required' using errcode = '22023';
+  end if;
+  if p_lease_seconds is null or p_lease_seconds < 1 then
+    raise exception 'The lease must be at least one second' using errcode = '22023';
+  end if;
+  if p_max_attempts is null or p_max_attempts < 1 then
+    raise exception 'The attempt budget must be at least one' using errcode = '22023';
+  end if;
 
-  get diagnostics v_rows = row_count;
-  return v_rows > 0;
+  -- Serialises every worker touching this occurrence, so two of them cannot
+  -- both observe an expired lease and both decide to reclaim it.
+  select * into v_row
+    from public.reminder_deliveries
+   where reminder_id = p_reminder_id
+     and occurrence = p_occurrence
+     for update;
+
+  if not found then
+    insert into public.reminder_deliveries
+      (reminder_id, occurrence, worker, attempts, lease_expires_at, last_attempt_at)
+    values
+      (p_reminder_id, p_occurrence, p_worker, 1,
+       now() + make_interval(secs => p_lease_seconds), now());
+
+    return jsonb_build_object('claimed', true, 'attempt', 1, 'reason', 'new');
+  end if;
+
+  if v_row.delivered then
+    return jsonb_build_object('claimed', false, 'attempt', v_row.attempts, 'reason', 'already_delivered');
+  end if;
+
+  if v_row.lease_expires_at is not null and v_row.lease_expires_at > now() then
+    return jsonb_build_object('claimed', false, 'attempt', v_row.attempts, 'reason', 'lease_active');
+  end if;
+
+  if v_row.attempts >= p_max_attempts then
+    return jsonb_build_object('claimed', false, 'attempt', v_row.attempts, 'reason', 'attempts_exhausted');
+  end if;
+
+  -- The previous holder died or failed without recording an outcome. Take over.
+  update public.reminder_deliveries
+     set attempts         = v_row.attempts + 1,
+         worker           = p_worker,
+         lease_expires_at = now() + make_interval(secs => p_lease_seconds),
+         last_attempt_at  = now()
+   where id = v_row.id
+  returning attempts into v_attempt;
+
+  return jsonb_build_object('claimed', true, 'attempt', v_attempt, 'reason', 'lease_expired');
+exception
+  when unique_violation then
+    -- Another worker inserted the row between our SELECT and INSERT.
+    return jsonb_build_object('claimed', false, 'attempt', 1, 'reason', 'lease_active');
 end $$;
 
+-- Record the outcome of a claimed attempt.
+--
+-- Success ends the occurrence permanently. Failure releases the lease so the
+-- next scheduler run can retry, after a short backoff, while attempts remain —
+-- the occurrence is therefore recoverable but never retried without bound.
+drop function if exists public.rpc_mark_reminder_delivery(uuid, timestamptz, boolean, text);
+
 create or replace function public.rpc_mark_reminder_delivery(
-  p_reminder_id uuid,
-  p_occurrence  timestamptz,
-  p_delivered   boolean,
-  p_error       text default null
+  p_reminder_id         uuid,
+  p_occurrence          timestamptz,
+  p_delivered           boolean,
+  p_error               text default null,
+  p_retry_after_seconds integer default 60
 )
-returns void
-language sql
+returns jsonb
+language plpgsql
 security definer
 set search_path = public
 as $$
+declare v_attempt integer;
+begin
   update public.reminder_deliveries
-     set delivered = p_delivered, error = left(p_error, 500)
-   where reminder_id = p_reminder_id and occurrence = p_occurrence;
-$$;
+     set delivered   = p_delivered,
+         error       = left(p_error, 500),
+         finished_at = case when p_delivered then now() else null end,
+         -- Delivered: no lease, so nothing can ever reclaim it.
+         -- Failed: hand it back for a later attempt.
+         lease_expires_at = case
+           when p_delivered then null
+           else now() + make_interval(secs => greatest(coalesce(p_retry_after_seconds, 60), 0))
+         end
+   where reminder_id = p_reminder_id
+     and occurrence = p_occurrence
+  returning attempts into v_attempt;
 
-revoke all on function public.rpc_claim_reminder(uuid, timestamptz, text) from public, anon, authenticated;
-revoke all on function public.rpc_mark_reminder_delivery(uuid, timestamptz, boolean, text) from public, anon, authenticated;
-grant execute on function public.rpc_claim_reminder(uuid, timestamptz, text) to service_role;
-grant execute on function public.rpc_mark_reminder_delivery(uuid, timestamptz, boolean, text) to service_role;
+  if v_attempt is null then
+    raise exception 'No claim exists for this occurrence' using errcode = 'P0002';
+  end if;
 
--- Housekeeping: claims older than 90 days are not needed for retries.
+  return jsonb_build_object('ok', true, 'delivered', p_delivered, 'attempt', v_attempt);
+end $$;
+
+revoke all on function public.rpc_claim_reminder(uuid, timestamptz, text, integer, integer) from public, anon, authenticated;
+revoke all on function public.rpc_mark_reminder_delivery(uuid, timestamptz, boolean, text, integer) from public, anon, authenticated;
+grant execute on function public.rpc_claim_reminder(uuid, timestamptz, text, integer, integer) to service_role;
+grant execute on function public.rpc_mark_reminder_delivery(uuid, timestamptz, boolean, text, integer) to service_role;
+
+-- Housekeeping: settled claims older than 90 days are not needed for retries.
+-- Undelivered rows inside their attempt budget are kept so recovery survives.
 create or replace function public.rpc_prune_reminder_deliveries()
 returns integer
 language plpgsql
@@ -286,7 +403,9 @@ set search_path = public
 as $$
 declare v_count integer;
 begin
-  delete from public.reminder_deliveries where claimed_at < now() - interval '90 days';
+  delete from public.reminder_deliveries
+   where claimed_at < now() - interval '90 days'
+     and (delivered or finished_at is not null);
   get diagnostics v_count = row_count;
   return v_count;
 end $$;
@@ -298,21 +417,97 @@ grant execute on function public.rpc_prune_reminder_deliveries() to service_role
 -- Admin deactivation must also clear the role grants, so reactivating a profile
 -- is a deliberate two-step act rather than an accidental privilege restore.
 -- ----------------------------------------------------------------------------
+-- Activate or deactivate an EXISTING administrator.
+--
+-- This function is deliberately not a general-purpose account toggle:
+--
+--   * it never writes profiles.role, so it cannot promote anybody. The previous
+--     version ran `set is_active = p_active, role = 'admin'`, which silently
+--     turned any user id passed to it into an administrator — a privilege
+--     escalation reachable from a normal "reactivate account" action;
+--   * the target must already be an admin account (role = 'admin') and must not
+--     be linked to a client portal;
+--   * deactivating the last active administrator is refused, because that would
+--     strand the workspace with nobody able to sign in;
+--   * both directions are audited with the before/after state.
+--
+-- The return type changed from void to jsonb; the old signature is dropped
+-- first so this also upgrades a database that already ran the previous version.
+drop function if exists public.rpc_set_admin_active(uuid, boolean);
+
 create or replace function public.rpc_set_admin_active(p_user_id uuid, p_active boolean)
-returns void
+returns jsonb
 language plpgsql
 security definer
 set search_path = public
 as $$
+declare
+  v_target    public.profiles%rowtype;
+  v_before    jsonb;
+  v_remaining integer;
 begin
   perform public.assert_admin();
+
+  if p_user_id is null or p_active is null then
+    raise exception 'A user id and target state are required' using errcode = '22023';
+  end if;
+
   if p_user_id = auth.uid() and not p_active then
     raise exception 'You cannot deactivate your own account' using errcode = 'P0001';
   end if;
 
-  update public.profiles set is_active = p_active, role = 'admin' where id = p_user_id;
+  select * into v_target from public.profiles where id = p_user_id for update;
+  if not found then
+    raise exception 'No such account' using errcode = 'P0002';
+  end if;
+
+  -- Only accounts that are already administrators may be touched. This is the
+  -- guard that makes the RPC useless as an escalation primitive.
+  if v_target.role <> 'admin' then
+    raise exception
+      'Account % is not an administrator (role = %). This operation only activates or deactivates existing admins.',
+      p_user_id, v_target.role
+      using errcode = '42501';
+  end if;
+
+  if v_target.client_id is not null then
+    raise exception 'Account % is linked to a client portal and cannot be treated as an administrator',
+      p_user_id using errcode = '42501';
+  end if;
+
+  -- Idempotent: activating an active account is not an error, it is a no-op.
+  if v_target.is_active = p_active then
+    return jsonb_build_object('ok', true, 'changed', false, 'is_active', p_active);
+  end if;
+
+  if not p_active then
+    select count(*) into v_remaining
+      from public.profiles p
+     where p.role = 'admin'
+       and p.is_active
+       and p.id <> p_user_id;
+
+    if v_remaining = 0 then
+      raise exception 'Refusing to deactivate the last active administrator'
+        using errcode = 'P0001';
+    end if;
+  end if;
+
+  v_before := jsonb_build_object(
+    'is_active', v_target.is_active,
+    'role', v_target.role,
+    'has_admin_grant', exists (
+      select 1 from public.user_roles r
+       where r.user_id = p_user_id and r.role = 'admin'
+    )
+  );
+
+  -- Only is_active is written. `role` is never assigned in this function.
+  update public.profiles set is_active = p_active where id = p_user_id;
 
   if p_active then
+    -- Restore the grant that deactivation removed, so is_admin() works through
+    -- both paths again. The role itself is untouched.
     insert into public.user_roles (user_id, role, granted_by)
     values (p_user_id, 'admin', auth.uid())
     on conflict (user_id, role) do nothing;
@@ -324,8 +519,12 @@ begin
 
   perform public.audit(
     case when p_active then 'admin.activate' else 'admin.deactivate' end,
-    'profiles', p_user_id, null, jsonb_build_object('is_active', p_active)
+    'profiles', p_user_id,
+    v_before,
+    jsonb_build_object('is_active', p_active, 'role', v_target.role)
   );
+
+  return jsonb_build_object('ok', true, 'changed', true, 'is_active', p_active);
 end $$;
 
 grant execute on function public.rpc_set_admin_active(uuid, boolean) to authenticated;

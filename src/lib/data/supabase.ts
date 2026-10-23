@@ -9,6 +9,47 @@
 import { createClient, type SupabaseClient, type Session } from '@supabase/supabase-js';
 import type { DataAdapter, ListOptions, Row, TableName, RpcName, AuthAdapter, AccessResult } from './types';
 
+/**
+ * Invokes an Edge Function and always surfaces the function's own error body.
+ *
+ * supabase-js turns any non-2xx response into a generic `FunctionsHttpError`,
+ * so the useful part — `code` ("rate_limited", "access_disabled", …) and
+ * `retry_after` — lives on the attached Response. Reading it means the sign-in
+ * screen can say "wait a few minutes" instead of "verification failed", and it
+ * keeps both call sites below identical.
+ */
+async function invokeFunction<T>(
+  name: string,
+  body: Record<string, unknown>,
+): Promise<{
+  data: T | null;
+  error: { message: string; code?: string; retryAfterSeconds?: number } | null;
+}> {
+  const { data, error } = await client().functions.invoke(name, { body });
+
+  if (error) {
+    const context = (error as { context?: Response }).context;
+    if (context && typeof context.json === 'function') {
+      try {
+        const parsed = (await context.json()) as { error?: string; code?: string; retry_after?: number };
+        return {
+          data: null,
+          error: {
+            message: parsed.error ?? 'The service is unavailable. Please try again.',
+            code: parsed.code,
+            retryAfterSeconds: parsed.retry_after,
+          },
+        };
+      } catch {
+        /* response had no JSON body — fall through to the generic message */
+      }
+    }
+    return { data: null, error: { message: error.message || 'The service is unavailable. Please try again.' } };
+  }
+
+  return { data: (data as T) ?? null, error: null };
+}
+
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL as string | undefined;
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined;
 
@@ -301,22 +342,17 @@ export class SupabaseAuth implements AuthAdapter {
    * The browser never receives the user's password or a reusable secret.
    */
   async signInWithAccessCode(code: string): Promise<AccessResult> {
-    const { data, error } = await client().functions.invoke('access-code-login', {
-      body: { code: code.trim().toUpperCase() },
-    });
-    if (error) {
-      const ctx = (error as { context?: Response }).context;
-      if (ctx && typeof ctx.json === 'function') {
-        try {
-          const body = (await ctx.json()) as { error?: string; retry_after?: number };
-          return { ok: false, error: body.error ?? 'Sign-in failed.', retryAfterSeconds: body.retry_after };
-        } catch {
-          /* fall through */
-        }
-      }
-      return { ok: false, error: 'Sign-in service is unavailable. Please try again.' };
-    }
-    const body = data as { kind?: string; token_hash?: string; error?: string; retry_after?: number; role?: string; display_name?: string };
+    const { data, error } = await invokeFunction<{
+      kind?: string;
+      token_hash?: string;
+      error?: string;
+      retry_after?: number;
+      role?: string;
+      display_name?: string;
+    }>('access-code-login', { code: code.trim().toUpperCase() });
+
+    if (error) return { ok: false, error: error.message, retryAfterSeconds: error.retryAfterSeconds };
+    const body = data;
     if (body?.error) return { ok: false, error: body.error, retryAfterSeconds: body.retry_after };
     if (body?.token_hash) {
       // The Edge Function mints the hash with generateLink({ type: 'magiclink' }),
@@ -333,11 +369,17 @@ export class SupabaseAuth implements AuthAdapter {
    * is what authenticates, and the role claim is verified again by RLS.
    */
   async signInAdminWithCode(code: string, password: string): Promise<AccessResult> {
-    const { data, error } = await client().functions.invoke('access-code-login', {
-      body: { code: code.trim().toUpperCase(), intent: 'admin_lookup' },
-    });
-    if (error) return { ok: false, error: 'Administrator code verification failed.' };
-    const body = data as { kind?: string; email?: string; error?: string };
+    const { data, error } = await invokeFunction<{ kind?: string; email?: string; error?: string }>(
+      'access-code-login',
+      { code: code.trim().toUpperCase(), intent: 'admin_lookup' },
+    );
+
+    // Rate limiting is per-IP *and* per-code prefix, but a locked-out
+    // administrator needs to be told to wait rather than told their code is
+    // wrong — otherwise they retry immediately and extend the lockout.
+    if (error) return { ok: false, error: error.message, retryAfterSeconds: error.retryAfterSeconds };
+
+    const body = data;
     if (body?.error || body?.kind !== 'admin' || !body.email) {
       return { ok: false, error: 'That is not a valid administrator code.' };
     }

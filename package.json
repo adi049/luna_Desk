@@ -14,7 +14,8 @@
     "check:rpc": "node scripts/check-rpc-contract.mjs",
     "check:secrets": "node scripts/scan-secrets.mjs",
     "check:secrets:history": "node scripts/scan-secrets.mjs --history",
-    "verify": "tsc --noEmit && node scripts/check-rpc-contract.mjs && node scripts/scan-secrets.mjs"
+    "verify": "tsc --noEmit && node scripts/check-rpc-contract.mjs && node scripts/scan-secrets.mjs",
+    "test:verifier": "scripts/test-verify-migrations.sh"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.1",

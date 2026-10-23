@@ -33,7 +33,19 @@ succeed. If the lookup code leaks, an attacker learns one address.
 - **Deactivation is authoritative.** `is_admin()` requires an *active* profile
   and only then considers the `user_roles` grant, so deactivating an admin
   revokes authorization through both paths at once. `rpc_set_admin_active()`
-  additionally clears the role row, so re-activation is deliberate.
+  only ever changes `is_active`; it never writes `role`. That asymmetry is
+  deliberate. An earlier version did `set is_active = p_active, role = 'admin'`,
+  which meant any signed-in user could call the RPC and promote themselves — it
+  was both an escalation *and* a role rewrite. The function now refuses any
+  target whose profile is not already an administrator (SQLSTATE `42501`),
+  refuses client-linked profiles, refuses self-deactivation and refuses to
+  remove the last active administrator, and it writes an `admin.deactivate` /
+  `admin.reactivate` audit row before and after the change.
+- **Admin bootstrap is not an API.** `rpc_promote_admin()` is executable by no
+  role at all (not `anon`, not `authenticated`, not even `service_role`), so it
+  can only be run from the SQL editor as the function owner. Migration 0009 also
+  installs a tripwire that fails the migration if any future function assigns
+  `role = 'admin'` outside the two reviewed ones.
 - **Internal notes are a separate table.** `public.internal_notes` has no client
   policy at all, because RLS filters rows, not columns — an `internal_notes`
   column on `clients` would be readable by the client whose row it describes.

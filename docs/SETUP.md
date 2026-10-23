@@ -167,9 +167,15 @@ immediately exchanges for a session.
    The workflow **fails before building** if `VITE_SUPABASE_URL` or
    `VITE_SUPABASE_ANON_KEY` is missing, and `vite build` itself refuses to emit
    a live bundle without them — so a half-configured deploy stops in CI instead
-   of publishing an app that cannot sign anyone in. It also runs the RPC
-   contract check (`scripts/check-rpc-contract.mjs`) and a secret scan
-   (`scripts/scan-secrets.mjs`).
+   of publishing an app that cannot sign anyone in. The guard also rejects
+   values that are still the `.env.example` placeholders (`YOUR-PROJECT`,
+   `your-anon-publishable-key`), keys shorter than a real publishable key, and
+   any URL that is not `https` (plain `http` is accepted only for `localhost` /
+   `127.0.0.1`, for a local `supabase start`). Copying `.env.example` unchanged
+   therefore cannot produce a "successful" deploy of a dead site — a failure
+   mode that previously passed, because placeholder strings are non-empty. The
+   workflow also runs the RPC contract check (`scripts/check-rpc-contract.mjs`)
+   and a secret scan (`scripts/scan-secrets.mjs`).
 5. Push to `main`. The workflow typechecks, builds, and publishes `dist/`.
 
 Routing uses `HashRouter`, so deep links such as

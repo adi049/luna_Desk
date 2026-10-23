@@ -570,8 +570,8 @@ do $$
 declare
   v_reminder uuid;
   v_occ      timestamptz := date_trunc('minute', now());
-  v_first    boolean;
-  v_second   boolean;
+  v_first    jsonb;
+  v_second   jsonb;
 begin
   insert into auth.users (id, email) values ('44444444-4444-4444-8444-444444444444', 'worker@example.test')
   on conflict do nothing;
@@ -582,21 +582,136 @@ begin
   v_first  := public.rpc_claim_reminder(v_reminder, v_occ, 'worker-a');
   v_second := public.rpc_claim_reminder(v_reminder, v_occ, 'worker-b');
 
-  perform public.test_assert(v_first, 'the first scheduler run claims the occurrence');
-  perform public.test_assert(not v_second, 'a concurrent second run cannot claim the same occurrence');
+  perform public.test_assert((v_first ->> 'claimed')::boolean,
+    'the first scheduler run claims the occurrence');
+  perform public.test_assert((v_second ->> 'claimed')::boolean = false,
+    'a concurrent second run cannot claim the same occurrence');
+  perform public.test_assert(v_second ->> 'reason' = 'lease_active',
+    'the refusal is explained as a live lease, not as success');
   perform public.test_assert(
     (select count(*) from public.reminder_deliveries where reminder_id = v_reminder) = 1,
     'exactly one delivery row exists for one occurrence');
 
   -- The next occurrence of a repeating reminder is claimable again.
   perform public.test_assert(
-    public.rpc_claim_reminder(v_reminder, v_occ + interval '1 day', 'worker-a'),
+    (public.rpc_claim_reminder(v_reminder, v_occ + interval '1 day', 'worker-a') ->> 'claimed')::boolean,
     'a later occurrence gets its own claim');
 
   perform public.rpc_mark_reminder_delivery(v_reminder, v_occ, false, 'push 500');
   perform public.test_assert(
     (select error from public.reminder_deliveries where reminder_id = v_reminder and occurrence = v_occ) = 'push 500',
-    'delivery failures are recorded for retry instead of being lost');
+    'delivery failures are recorded instead of being lost');
+end $$;
+
+-- 5i. A crashed worker must not make an occurrence permanently unclaimable ---
+do $$
+declare
+  v_reminder uuid;
+  v_occ      timestamptz := date_trunc('minute', now()) + interval '1 hour';
+  v_first    jsonb;
+  v_blocked  jsonb;
+  v_recovered jsonb;
+begin
+  insert into public.reminders (owner_id, title, remind_at)
+  values ('44444444-4444-4444-8444-444444444444', 'Crash recovery', v_occ)
+  returning id into v_reminder;
+
+  -- Worker A takes the claim and then "crashes": it never records an outcome.
+  v_first := public.rpc_claim_reminder(v_reminder, v_occ, 'worker-a', 300);
+
+  -- Immediately afterwards the lease is still live, so nobody else may send.
+  v_blocked := public.rpc_claim_reminder(v_reminder, v_occ, 'worker-b', 300);
+  perform public.test_assert((v_blocked ->> 'claimed')::boolean = false,
+    'a live lease still blocks a second worker (duplicate-delivery protection)');
+  perform public.test_assert(v_blocked ->> 'reason' = 'lease_active',
+    'the block is reported as lease_active');
+
+  -- Simulate the lease running out.
+  update public.reminder_deliveries
+     set lease_expires_at = now() - interval '1 second'
+   where reminder_id = v_reminder and occurrence = v_occ;
+
+  v_recovered := public.rpc_claim_reminder(v_reminder, v_occ, 'worker-b', 300, 5);
+  perform public.test_assert((v_recovered ->> 'claimed')::boolean = true,
+    'an expired lease is reclaimable, so a crashed worker does not strand the occurrence');
+  perform public.test_assert(v_recovered ->> 'reason' = 'lease_expired',
+    'the recovery is reported as lease_expired');
+  perform public.test_assert((v_recovered ->> 'attempt')::int = 2,
+    'the retry is counted as attempt 2');
+  perform public.test_assert(
+    (select count(*) from public.reminder_deliveries where reminder_id = v_reminder) = 1,
+    'recovery reuses the single delivery row rather than creating a second one');
+end $$;
+
+-- 5j. Retries are bounded, and delivered occurrences are terminal -------------
+do $$
+declare
+  v_reminder uuid;
+  v_occ      timestamptz := date_trunc('minute', now()) + interval '2 hours';
+  v_res      jsonb;
+  i          integer;
+begin
+  insert into public.reminders (owner_id, title, remind_at)
+  values ('44444444-4444-4444-8444-444444444444', 'Bounded retries', v_occ)
+  returning id into v_reminder;
+
+  -- Three permitted attempts (max_attempts = 3).
+  perform public.rpc_claim_reminder(v_reminder, v_occ, 'w1', 300, 3);
+  for i in 2..3 loop
+    update public.reminder_deliveries set lease_expires_at = now() - interval '1 second'
+     where reminder_id = v_reminder and occurrence = v_occ;
+    perform public.rpc_claim_reminder(v_reminder, v_occ, 'w' || i, 300, 3);
+  end loop;
+
+  update public.reminder_deliveries set lease_expires_at = now() - interval '1 second'
+   where reminder_id = v_reminder and occurrence = v_occ;
+  v_res := public.rpc_claim_reminder(v_reminder, v_occ, 'w4', 300, 3);
+
+  perform public.test_assert((v_res ->> 'claimed')::boolean = false,
+    'the attempt budget stops a permanently failing occurrence from retrying forever');
+  perform public.test_assert(v_res ->> 'reason' = 'attempts_exhausted',
+    'exhaustion is reported distinctly from an active lease');
+
+  -- A delivered occurrence is never reclaimed, even after its lease would expire.
+  update public.reminder_deliveries
+     set delivered = true, finished_at = now(), lease_expires_at = null
+   where reminder_id = v_reminder and occurrence = v_occ;
+  v_res := public.rpc_claim_reminder(v_reminder, v_occ, 'w5', 300, 10);
+  perform public.test_assert((v_res ->> 'claimed')::boolean = false,
+    'a delivered occurrence can never be claimed again');
+  perform public.test_assert(v_res ->> 'reason' = 'already_delivered',
+    'the refusal is reported as already_delivered');
+end $$;
+
+-- 5k. A failed delivery releases the lease so the next run can retry ----------
+do $$
+declare
+  v_reminder uuid;
+  v_occ      timestamptz := date_trunc('minute', now()) + interval '3 hours';
+  v_res      jsonb;
+begin
+  insert into public.reminders (owner_id, title, remind_at)
+  values ('44444444-4444-4444-8444-444444444444', 'Retry after failure', v_occ)
+  returning id into v_reminder;
+
+  perform public.rpc_claim_reminder(v_reminder, v_occ, 'w1', 300, 5);
+  -- A push failure is reported immediately, with no retry delay.
+  perform public.rpc_mark_reminder_delivery(v_reminder, v_occ, false, 'push 500', 0);
+
+  v_res := public.rpc_claim_reminder(v_reminder, v_occ, 'w2', 300, 5);
+  perform public.test_assert((v_res ->> 'claimed')::boolean = true,
+    'a recorded failure hands the occurrence back for an immediate retry');
+  perform public.test_assert((v_res ->> 'attempt')::int = 2,
+    'the retry after failure is attempt 2');
+
+  -- Successful delivery ends it.
+  perform public.rpc_mark_reminder_delivery(v_reminder, v_occ, true, null);
+  perform public.test_assert(
+    (select delivered from public.reminder_deliveries where reminder_id = v_reminder and occurrence = v_occ) = true,
+    'successful delivery is recorded as delivered');
+  perform public.test_assert(
+    (select lease_expires_at from public.reminder_deliveries where reminder_id = v_reminder and occurrence = v_occ) is null,
+    'a delivered occurrence holds no lease, so nothing can reclaim it');
 end $$;
 
 -- 5h. Internal notes upsert path (what the Supabase adapter actually sends) ---
@@ -624,6 +739,233 @@ begin
     (select body from public.internal_notes where client_id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa') = 'second note',
     'the upserted internal note keeps the newest body');
 end $$;
+
+-- ===========================================================================
+-- 6. rpc_set_admin_active() is an admin-account toggle, not a promotion path
+-- ===========================================================================
+reset role;
+select set_config('request.jwt.claim.sub', '', true);
+
+-- Extra fixtures: a client-linked profile and a plain user with no role.
+insert into auth.users (id, email) values
+  ('55555555-5555-4555-8555-555555555551', 'client-target@example.test'),
+  ('55555555-5555-4555-8555-555555555552', 'plain-target@example.test'),
+  ('55555555-5555-4555-8555-555555555553', 'second-admin@example.test')
+on conflict do nothing;
+
+update public.profiles set role = 'client', client_id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+ where id = '55555555-5555-4555-8555-555555555551';
+update public.profiles set role = 'client', client_id = null
+ where id = '55555555-5555-4555-8555-555555555552';
+update public.profiles set role = 'admin', is_active = true
+ where id = '55555555-5555-4555-8555-555555555553';
+
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '11111111-1111-4111-8111-111111111111', true);
+
+-- 6a. A client-linked account cannot be promoted by "activation".
+do $$
+declare v_blocked boolean := false;
+begin
+  begin
+    perform public.rpc_set_admin_active('55555555-5555-4555-8555-555555555551', true);
+  exception when others then v_blocked := true;
+  end;
+  perform public.test_assert(v_blocked,
+    'a client-linked account cannot be activated as an admin');
+end $$;
+
+-- 6b. An ordinary user cannot be promoted either — and must stay untouched.
+do $$
+declare v_blocked boolean := false; v_role text; v_active boolean; v_grants int;
+begin
+  begin
+    perform public.rpc_set_admin_active('55555555-5555-4555-8555-555555555552', true);
+  exception when others then v_blocked := true;
+  end;
+
+  select role, is_active into v_role, v_active
+    from public.profiles where id = '55555555-5555-4555-8555-555555555552';
+  select count(*) into v_grants
+    from public.user_roles where user_id = '55555555-5555-4555-8555-555555555552';
+
+  perform public.test_assert(v_blocked,
+    'an ordinary user cannot be promoted to admin through rpc_set_admin_active');
+  perform public.test_assert(v_role = 'client',
+    'the rejected promotion leaves the target role unchanged');
+  perform public.test_assert(v_grants = 0,
+    'the rejected promotion grants no admin role row');
+
+  -- Deactivation is equally refused for a non-admin.
+  v_blocked := false;
+  begin
+    perform public.rpc_set_admin_active('55555555-5555-4555-8555-555555555552', false);
+  exception when others then v_blocked := true;
+  end;
+  perform public.test_assert(v_blocked,
+    'a non-admin cannot be deactivated through the admin RPC either');
+end $$;
+
+-- 6c. A real admin is toggled, and the role is preserved, not re-assigned.
+do $$
+declare
+  v_blocked boolean;
+  v_res     jsonb;
+  v_role    text;
+  v_active  boolean;
+  v_audit   int;
+begin
+  select count(*) into v_audit from public.audit_logs where action = 'admin.deactivate';
+
+  -- With a second active admin present, deactivation is allowed.
+  v_res := public.rpc_set_admin_active('55555555-5555-4555-8555-555555555553', false);
+  select role, is_active into v_role, v_active
+    from public.profiles where id = '55555555-5555-4555-8555-555555555553';
+
+  perform public.test_assert((v_res ->> 'changed')::boolean,
+    'deactivating an existing admin succeeds when another admin remains');
+  perform public.test_assert(v_active = false, 'the target is deactivated');
+  perform public.test_assert(v_role = 'admin',
+    'deactivation preserves the admin role instead of rewriting it');
+  perform public.test_assert(
+    (select count(*) from public.audit_logs where action = 'admin.deactivate') = v_audit + 1,
+    'the deactivation is audited');
+
+  -- Reactivation restores the grant and still never rewrites the role.
+  v_res := public.rpc_set_admin_active('55555555-5555-4555-8555-555555555553', true);
+  select role, is_active into v_role, v_active
+    from public.profiles where id = '55555555-5555-4555-8555-555555555553';
+  perform public.test_assert((v_res ->> 'changed')::boolean, 'reactivation succeeds');
+  perform public.test_assert(v_active = true, 'the admin is active again');
+  perform public.test_assert(v_role = 'admin', 'reactivation preserves the admin role');
+  perform public.test_assert(
+    exists (select 1 from public.user_roles where user_id = '55555555-5555-4555-8555-555555555553' and role = 'admin'),
+    'reactivation restores the admin grant so is_admin() works through both paths');
+
+  -- Idempotent: activating an already-active admin is a no-op, not an error.
+  v_res := public.rpc_set_admin_active('55555555-5555-4555-8555-555555555553', true);
+  perform public.test_assert((v_res ->> 'changed')::boolean = false,
+    'activating an already-active admin is a no-op');
+end $$;
+
+-- 6d. The workspace can never be left without an active administrator.
+--
+-- With the caller itself being the only active admin, the self-deactivation
+-- guard fires first and the count-based "last admin" check behind it is a
+-- defensive second gate. Both exist so that neither alone can lock the
+-- workspace out, so the assertion below checks the reachable path (self) by
+-- its message and verifies the end state (an active admin always survives).
+do $$
+declare
+  v_msg     text;
+  v_blocked boolean := false;
+  v_res     jsonb;
+  v_active  int;
+begin
+  -- Leave exactly one active admin: the caller.
+  perform public.rpc_set_admin_active('55555555-5555-4555-8555-555555555553', false);
+
+  select count(*) into v_active from public.profiles where role = 'admin' and is_active;
+  perform public.test_assert(v_active = 1,
+    'the fixture really leaves a single active administrator');
+
+  begin
+    perform public.rpc_set_admin_active('11111111-1111-4111-8111-111111111111', false);
+  exception when others then
+    v_msg := sqlerrm;
+    v_blocked := true;
+  end;
+
+  perform public.test_assert(v_blocked,
+    'the sole remaining administrator cannot deactivate themselves');
+  perform public.test_assert(v_msg ilike '%your own account%',
+    'the refusal names the self-deactivation rule rather than failing obscurely');
+
+  select count(*) into v_active from public.profiles where role = 'admin' and is_active;
+  perform public.test_assert(v_active = 1,
+    'a failed attempt leaves the workspace with an active administrator');
+
+  -- Restore the second admin so later tests see the original fixture.
+  v_res := public.rpc_set_admin_active('55555555-5555-4555-8555-555555555553', true);
+  perform public.test_assert((v_res ->> 'changed')::boolean,
+    'the second admin can be restored afterwards');
+end $$;
+
+-- 6e. A client session cannot call the RPC at all.
+do $$
+declare v_blocked boolean := false;
+begin
+  perform set_config('request.jwt.claim.sub', '22222222-2222-4222-8222-222222222222', true);
+  begin
+    perform public.rpc_set_admin_active('55555555-5555-4555-8555-555555555552', true);
+  exception when others then v_blocked := true;
+  end;
+  perform public.test_assert(v_blocked,
+    'a client session cannot invoke rpc_set_admin_active');
+  perform set_config('request.jwt.claim.sub', '11111111-1111-4111-8111-111111111111', true);
+end $$;
+
+
+-- ===========================================================================
+-- 7. Admin role grants are audited and unreachable from the API
+-- ===========================================================================
+reset role;
+select set_config('request.jwt.claim.sub', '', true);
+
+-- 7a. The bootstrap RPC is not executable over the API by anyone.
+do $$
+begin
+  perform public.test_assert(
+    not has_function_privilege('anon', 'public.rpc_promote_admin(text)', 'execute'),
+    'anon cannot execute rpc_promote_admin');
+  perform public.test_assert(
+    not has_function_privilege('authenticated', 'public.rpc_promote_admin(text)', 'execute'),
+    'authenticated cannot execute rpc_promote_admin');
+  perform public.test_assert(
+    not has_function_privilege('service_role', 'public.rpc_promote_admin(text)', 'execute'),
+    'even service_role cannot mint an admin through the REST API');
+end $$;
+
+-- 7b. The privilege-escalation tripwire really fires. A function that assigns
+--     the admin role is planted, the same query used by migration 0009 is run
+--     against it, and the function is rolled back with the transaction. Without
+--     this the guard in 0009 could silently stop matching anything.
+do $$
+declare
+  v_found boolean := false;
+begin
+  create function public.tmp_escalating_function(p_user uuid)
+  returns void language plpgsql as $tmp$
+  begin
+    update public.profiles set is_active = true, role = 'admin' where id = p_user;
+  end $tmp$;
+
+  select exists (
+    select 1 from pg_proc p
+      join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'public'
+       and p.proname = 'tmp_escalating_function'
+       and pg_get_functiondef(p.oid) ~* 'update[^;]{0,200}set[^;]{0,200}role[[:space:]]*=[[:space:]]*''admin'''
+  ) into v_found;
+
+  perform public.test_assert(v_found,
+    'the escalation tripwire detects a function that assigns the admin role');
+
+  -- The legitimate authorisation helper must not be flagged.
+  select exists (
+    select 1 from pg_proc p
+      join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'public'
+       and p.proname = 'is_admin'
+       and pg_get_functiondef(p.oid) ~* 'update[^;]{0,200}set[^;]{0,200}role[[:space:]]*=[[:space:]]*''admin'''
+  ) into v_found;
+
+  perform public.test_assert(not v_found,
+    'the tripwire does not flag is_admin(), which only reads the role');
+
+  drop function public.tmp_escalating_function(uuid);
+end $$;
+
 
 rollback;
 

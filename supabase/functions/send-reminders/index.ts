@@ -11,7 +11,10 @@
 // Delivery is claimed before it is attempted (rpc_claim_reminder). The
 // (reminder_id, occurrence) unique key is the mutex, so overlapping scheduler
 // runs — or a rerun after a partial failure — cannot push the same occurrence
-// twice. A claim that fails to deliver is recorded, not retried silently.
+// twice. The claim is a lease rather than a permanent lock: a worker that dies
+// mid-delivery hands the occurrence back for retry once the lease expires, and
+// the number of attempts is capped so a permanently failing occurrence is
+// abandoned with a visible reason instead of retried forever.
 // =============================================================================
 
 import { json, preflight } from '../_shared/http.ts';
@@ -31,6 +34,42 @@ interface Reminder {
 }
 
 const WORKER = `scheduler:${crypto.randomUUID().slice(0, 8)}`;
+
+/** How long a claim holds before another run may retry the occurrence. */
+const LEASE_SECONDS = 300;
+/** Total delivery attempts before an occurrence is abandoned. */
+const MAX_ATTEMPTS = 5;
+
+interface ClaimResult {
+  claimed: boolean;
+  attempt: number;
+  reason: string;
+}
+
+/**
+ * rpc_claim_reminder returns jsonb. A boolean return value is still accepted so
+ * that an older deployed function version cannot be read as a truthy object and
+ * double-send.
+ */
+function normaliseClaim(data: unknown): ClaimResult {
+  if (typeof data === 'boolean') {
+    return { claimed: data, attempt: 1, reason: data ? 'new' : 'lease_active' };
+  }
+  if (data && typeof data === 'object') {
+    const record = data as Record<string, unknown>;
+    return {
+      claimed: record.claimed === true,
+      attempt: typeof record.attempt === 'number' ? record.attempt : 1,
+      reason: typeof record.reason === 'string' ? record.reason : 'unknown',
+    };
+  }
+  return { claimed: false, attempt: 1, reason: 'unknown' };
+}
+
+/** Linear backoff: 60s, 120s, 180s … so a flapping device is not hammered. */
+function retryAfterFor(attempt: number): number {
+  return Math.max(60, 60 * Math.max(1, attempt));
+}
 
 /** Add one repeat interval in the user's timezone, so DST does not drift. */
 const nextOccurrence = (iso: string, repeat: Reminder['repeat'], timeZone: string): Date => {
@@ -138,11 +177,16 @@ Deno.serve(async (req) => {
       continue;
     }
 
-    // Claim first. If another run already owns this occurrence, do nothing.
-    const { data: claimed, error: claimError } = await supabase.rpc('rpc_claim_reminder', {
+    // Claim first. The claim is a time-bounded lease: if this worker dies
+    // mid-delivery the occurrence becomes claimable again after LEASE_SECONDS
+    // instead of being stuck forever, and attempts are capped so a
+    // permanently failing occurrence cannot be retried without limit.
+    const { data: claimData, error: claimError } = await supabase.rpc('rpc_claim_reminder', {
       p_reminder_id: reminder.id,
       p_occurrence: occurrence,
       p_worker: WORKER,
+      p_lease_seconds: LEASE_SECONDS,
+      p_max_attempts: MAX_ATTEMPTS,
     });
 
     if (claimError) {
@@ -150,8 +194,20 @@ Deno.serve(async (req) => {
       failed += 1;
       continue;
     }
-    if (claimed !== true) {
-      skipped += 1;
+
+    // PostgREST returns the jsonb object; older deployments returned a boolean,
+    // so both shapes are accepted rather than silently treating an object as
+    // truthy and double-sending.
+    const claim = normaliseClaim(claimData);
+    if (!claim.claimed) {
+      if (claim.reason === 'attempts_exhausted') {
+        console.error('reminder abandoned after too many attempts', reminder.id, occurrence);
+        failed += 1;
+      } else {
+        // already_delivered / lease_active / lease_expired: another run owns it,
+        // or there is nothing left to do. Neither is an error.
+        skipped += 1;
+      }
       continue;
     }
 
@@ -182,6 +238,7 @@ Deno.serve(async (req) => {
         p_occurrence: occurrence,
         p_delivered: false,
         p_error: `notification insert: ${insertError.message}`,
+        p_retry_after_seconds: retryAfterFor(claim.attempt),
       });
       failed += 1;
       continue;
@@ -259,6 +316,10 @@ Deno.serve(async (req) => {
       p_occurrence: occurrence,
       p_delivered: pushError === null,
       p_error: pushError,
+      // A failed push releases the lease so the next run can retry the push
+      // without re-sending an in-app notification (the dedupe_key prevents a
+      // second row).
+      p_retry_after_seconds: pushError === null ? 0 : retryAfterFor(claim.attempt),
     });
     if (pushError) failed += 1;
   }
