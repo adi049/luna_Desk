@@ -3,14 +3,18 @@
   "private": true,
   "version": "1.0.0",
   "type": "module",
-  "description": "LunaDesk — the client & agency workspace for Managed by Luna",
+  "description": "LunaDesk \u2014 the client & agency workspace for Managed by Luna",
   "scripts": {
     "dev": "vite --host 0.0.0.0 --port 5173",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview --host 0.0.0.0",
     "typecheck": "tsc --noEmit",
     "verify:db": "scripts/verify-migrations.sh",
-    "keys:vapid": "node scripts/generate-vapid-keys.mjs"
+    "keys:vapid": "node scripts/generate-vapid-keys.mjs",
+    "check:rpc": "node scripts/check-rpc-contract.mjs",
+    "check:secrets": "node scripts/scan-secrets.mjs",
+    "check:secrets:history": "node scripts/scan-secrets.mjs --history",
+    "verify": "tsc --noEmit && node scripts/check-rpc-contract.mjs && node scripts/scan-secrets.mjs"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.1",

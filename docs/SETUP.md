@@ -47,6 +47,10 @@ PGHOST=127.0.0.1 PGUSER=postgres PGPASSWORD=postgres scripts/verify-migrations.s
 # → ALL TESTS PASSED / ✓ schema verified
 ```
 
+The same command is `npm run verify:db`. It needs a local PostgreSQL 15+ and
+**never** connects to a hosted project: it drops and recreates a scratch
+database named `lunadesk_verify`.
+
 The script recreates a scratch database, applies every migration and runs
 `supabase/tests/rls.sql` (~48 assertions on isolation, money and access).
 
@@ -82,6 +86,11 @@ supabase functions deploy access-code-login     # public: code → token hash
 supabase functions deploy admin-clients         # admin-only: portal identities
 supabase functions deploy send-reminders        # scheduler: reminders + push
 ```
+
+`APP_ORIGINS` is **required**. The functions answer only the exact origins you
+list (comma separated, no trailing slash). If it is unset, CORS refuses every
+browser request — fail-closed by design, because `access-code-login` accepts a
+credential.
 
 Secrets (server side only):
 
@@ -154,6 +163,13 @@ immediately exchanges for a session.
 4. `BASE_PATH` is derived automatically from the repository name by
    `.github/workflows/deploy.yml` (use `/` for a custom domain by editing that
    one line).
+
+   The workflow **fails before building** if `VITE_SUPABASE_URL` or
+   `VITE_SUPABASE_ANON_KEY` is missing, and `vite build` itself refuses to emit
+   a live bundle without them — so a half-configured deploy stops in CI instead
+   of publishing an app that cannot sign anyone in. It also runs the RPC
+   contract check (`scripts/check-rpc-contract.mjs`) and a secret scan
+   (`scripts/scan-secrets.mjs`).
 5. Push to `main`. The workflow typechecks, builds, and publishes `dist/`.
 
 Routing uses `HashRouter`, so deep links such as

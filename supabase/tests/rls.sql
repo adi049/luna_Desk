@@ -169,9 +169,11 @@ do $$
 begin
   update public.invoices set due_date = current_date - 1
   where id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+  -- The status guard recomputes the stored value on any write that could
+  -- affect it, so stored and effective status agree once the due date passes.
   perform public.test_assert(
-    (select status from public.invoices where id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd') = 'partially_paid',
-    'stored status is recomputed by the payment trigger, not by the date');
+    (select status from public.invoices where id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd') = 'overdue',
+    'stored status is recomputed by the guard when the due date passes');
   perform public.test_assert(
     (select effective_status from public.invoice_balances
       where invoice_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd') = 'overdue',
@@ -212,15 +214,27 @@ select public.test_assert(
   'first receipt snapshot: paid 3,000 against a 5,000 invoice → 2,000 remaining');
 
 do $$
-declare v_blocked boolean := false;
+declare
+  v_first  uuid;
+  v_second uuid;
+  v_count  integer;
 begin
-  begin
-    perform public.rpc_issue_receipt(
-      (select id from public.payments
-        where invoice_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd' and amount_minor = 300000), null);
-  exception when others then v_blocked := true;
-  end;
-  perform public.test_assert(v_blocked, 'a payment cannot be receipted twice');
+  select id into v_first from public.receipts
+   where payment_id = (select id from public.payments
+                        where invoice_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd' and amount_minor = 300000);
+
+  v_second := (public.rpc_issue_receipt(
+    (select id from public.payments
+      where invoice_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd' and amount_minor = 300000), null)).id;
+
+  select count(*) into v_count from public.receipts
+   where payment_id = (select id from public.payments
+                        where invoice_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd' and amount_minor = 300000);
+
+  perform public.test_assert(v_second = v_first,
+    'issuing a receipt twice is idempotent — it returns the original document');
+  perform public.test_assert(v_count = 1,
+    'one payment still maps to exactly one receipt');
 end $$;
 
 -- Snapshot is immutable in spirit: the second receipt must reflect payment 1.
@@ -378,6 +392,238 @@ begin
   perform public.test_assert(v_blocked, 'the admin lookup RPC is not executable by clients');
 end $$;
 reset role;
+
+
+-- ===========================================================================
+-- 5. Pre-deployment hardening (migration 0007 / 0008)
+-- ===========================================================================
+
+-- 5a. Deactivating an admin revokes authorization through BOTH paths --------
+reset role;
+select set_config('request.jwt.claim.sub', '11111111-1111-4111-8111-111111111111', true);
+select public.test_assert(public.is_admin(), 'the admin is authorized while active');
+
+-- Grant the role through the alternative table too, then deactivate.
+select public.rpc_set_admin_active('11111111-1111-4111-8111-111111111111', true);
+update public.profiles set is_active = false
+ where id = '11111111-1111-4111-8111-111111111111';
+insert into public.user_roles (user_id, role)
+values ('11111111-1111-4111-8111-111111111111', 'admin')
+on conflict do nothing;
+
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '11111111-1111-4111-8111-111111111111', true);
+select public.test_assert(
+  not public.is_admin(),
+  'a deactivated admin is not authorized even with a user_roles grant');
+select public.test_assert(
+  (select count(*) from public.clients) = 0,
+  'a deactivated admin cannot read client rows through RLS');
+do $$
+declare v_blocked boolean := false;
+begin
+  begin
+    perform public.rpc_record_payment('dddddddd-dddd-4ddd-8ddd-dddddddddddd', 1000, current_date, 'upi');
+  exception when others then v_blocked := true;
+  end;
+  perform public.test_assert(v_blocked, 'a deactivated admin cannot call financial RPCs');
+end $$;
+
+-- Reactivate for the remaining tests. Clear the JWT claim first: the profile
+-- guard deliberately refuses privileged edits from a non-admin session, and an
+-- inactive admin is exactly that.
+reset role;
+select set_config('request.jwt.claim.sub', '', true);
+update public.profiles set is_active = true, role = 'admin'
+ where id = '11111111-1111-4111-8111-111111111111';
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '11111111-1111-4111-8111-111111111111', true);
+
+-- 5b. Financial history cannot be written through the REST surface ----------
+do $$
+declare v_blocked boolean := false;
+begin
+  begin
+    insert into public.payments (client_id, invoice_id, amount_minor, paid_at, method)
+    values ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+            'dddddddd-dddd-4ddd-8ddd-dddddddddddd', 999999, current_date, 'cash');
+  exception when insufficient_privilege then v_blocked := true;
+  end;
+  perform public.test_assert(v_blocked, 'an admin cannot INSERT a payment directly (table privilege revoked)');
+end $$;
+
+do $$
+declare v_blocked boolean = false;
+begin
+  begin
+    update public.payments set amount_minor = 1 where invoice_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+  exception when insufficient_privilege then v_blocked := true;
+  end;
+  perform public.test_assert(v_blocked, 'an admin cannot UPDATE a recorded payment directly');
+end $$;
+
+do $$
+declare v_blocked boolean := false;
+begin
+  begin
+    delete from public.payments where invoice_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+  exception when insufficient_privilege then v_blocked := true;
+  end;
+  perform public.test_assert(v_blocked, 'an admin cannot DELETE a payment (financial history is append-only)');
+end $$;
+
+do $$
+declare v_blocked boolean := false;
+begin
+  begin
+    update public.receipts set snapshot = '{}'::jsonb, receipt_number = 'FORGED-1';
+  exception when insufficient_privilege then v_blocked := true;
+  end;
+  perform public.test_assert(v_blocked, 'a receipt snapshot cannot be rewritten through the API');
+end $$;
+
+do $$
+declare v_blocked boolean := false;
+begin
+  begin
+    insert into public.document_sequences (prefix, year, last_value) values ('MBL-RCP', 2026, 9000);
+  exception when insufficient_privilege or unique_violation then v_blocked := true;
+  end;
+  perform public.test_assert(v_blocked, 'receipt numbering cannot be seeded from the client');
+end $$;
+
+-- 5c. Invoice status cannot be forged --------------------------------------
+do $$
+declare v_status public.payment_status;
+begin
+  update public.invoices set status = 'paid'
+   where id = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+  select status into v_status from public.invoices
+   where id = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+  perform public.test_assert(v_status <> 'paid',
+    'marking an unpaid invoice as paid is corrected to its derived status');
+
+  -- Cancelling is still an explicit, allowed action.
+  update public.invoices set status = 'cancelled'
+   where id = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+  select status into v_status from public.invoices
+   where id = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+  perform public.test_assert(v_status = 'cancelled', 'an invoice can still be cancelled deliberately');
+  update public.invoices set status = 'pending'
+   where id = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+end $$;
+
+-- 5d. Access-code expiry ----------------------------------------------------
+reset role;
+insert into public.client_access_codes (client_id, user_id, code_hash, expires_at)
+values ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+        '33333333-3333-4333-8333-333333333333',
+        extensions.crypt('EXP001', extensions.gen_salt('bf', 4)),
+        now() - interval '1 day');
+
+select public.test_assert(
+  (public.rpc_redeem_access_code('EXP001', '10.1.0.1'::inet, 'test')) ->> 'error' = 'invalid_code',
+  'an expired access code is rejected');
+
+insert into public.client_access_codes (client_id, user_id, code_hash, expires_at)
+values ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+        '33333333-3333-4333-8333-333333333333',
+        extensions.crypt('FUT001', extensions.gen_salt('bf', 4)),
+        now() + interval '30 days');
+select public.test_assert(
+  (public.rpc_redeem_access_code('FUT001', '10.1.0.2'::inet, 'test')) ->> 'ok' = 'true',
+  'an unexpired code still works');
+
+-- 5e. Admin-code limiter is per-IP, never global ----------------------------
+do $$
+declare i int; v_res jsonb; v_other jsonb;
+begin
+  -- Exhaust one attacker IP.
+  for i in 1..12 loop
+    v_res := public.rpc_lookup_admin_code('WRONG' || i, '10.66.66.66'::inet, 'test');
+  end loop;
+  perform public.test_assert(v_res ->> 'error' = 'rate_limited',
+    'a single IP is rate limited after repeated bad admin codes');
+
+  -- A legitimate admin on a different IP must still get through.
+  v_other := public.rpc_lookup_admin_code('ADI000', '10.77.77.77'::inet, 'test');
+  perform public.test_assert(v_other ->> 'ok' = 'true',
+    'a different IP is NOT locked out by another caller''s failures (no global lockout)');
+end $$;
+
+-- 5f. Revoked portal profile blocks a still-valid code ---------------------
+reset role;
+insert into public.client_access_codes (client_id, user_id, code_hash)
+values ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+        '33333333-3333-4333-8333-333333333333',
+        extensions.crypt('LIVE01', extensions.gen_salt('bf', 4)));
+update public.profiles set is_active = false
+ where id = '33333333-3333-4333-8333-333333333333';
+select public.test_assert(
+  (public.rpc_redeem_access_code('LIVE01', '10.1.0.3'::inet, 'test')) ->> 'error' = 'access_disabled',
+  'a deactivated portal profile cannot sign in even with a valid code');
+update public.profiles set is_active = true
+ where id = '33333333-3333-4333-8333-333333333333';
+
+-- 5g. Reminder claiming is atomic -----------------------------------------
+do $$
+declare
+  v_reminder uuid;
+  v_occ      timestamptz := date_trunc('minute', now());
+  v_first    boolean;
+  v_second   boolean;
+begin
+  insert into auth.users (id, email) values ('44444444-4444-4444-8444-444444444444', 'worker@example.test')
+  on conflict do nothing;
+  insert into public.reminders (owner_id, title, remind_at)
+  values ('44444444-4444-4444-8444-444444444444', 'Claim test', v_occ)
+  returning id into v_reminder;
+
+  v_first  := public.rpc_claim_reminder(v_reminder, v_occ, 'worker-a');
+  v_second := public.rpc_claim_reminder(v_reminder, v_occ, 'worker-b');
+
+  perform public.test_assert(v_first, 'the first scheduler run claims the occurrence');
+  perform public.test_assert(not v_second, 'a concurrent second run cannot claim the same occurrence');
+  perform public.test_assert(
+    (select count(*) from public.reminder_deliveries where reminder_id = v_reminder) = 1,
+    'exactly one delivery row exists for one occurrence');
+
+  -- The next occurrence of a repeating reminder is claimable again.
+  perform public.test_assert(
+    public.rpc_claim_reminder(v_reminder, v_occ + interval '1 day', 'worker-a'),
+    'a later occurrence gets its own claim');
+
+  perform public.rpc_mark_reminder_delivery(v_reminder, v_occ, false, 'push 500');
+  perform public.test_assert(
+    (select error from public.reminder_deliveries where reminder_id = v_reminder and occurrence = v_occ) = 'push 500',
+    'delivery failures are recorded for retry instead of being lost');
+end $$;
+
+-- 5h. Internal notes upsert path (what the Supabase adapter actually sends) ---
+reset role;
+select set_config('request.jwt.claim.sub', '11111111-1111-4111-8111-111111111111', true);
+do $$
+declare v_count integer;
+begin
+  -- The adapter uses ON CONFLICT (client_id); this only works when the unique
+  -- index PostgREST infers is a real constraint target.
+  insert into public.internal_notes (client_id, body)
+  values ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'first note')
+  on conflict (client_id) do update set body = excluded.body;
+
+  insert into public.internal_notes (client_id, body)
+  values ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'second note')
+  on conflict (client_id) do update set body = excluded.body;
+
+  select count(*) into v_count from public.internal_notes
+   where client_id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+
+  perform public.test_assert(v_count = 1,
+    'internal notes upsert on (client_id) updates in place instead of failing or duplicating');
+  perform public.test_assert(
+    (select body from public.internal_notes where client_id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa') = 'second note',
+    'the upserted internal note keeps the newest body');
+end $$;
 
 rollback;
 

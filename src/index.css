@@ -211,6 +211,15 @@ body::before {
   }
 
   /* ---------- data table ---------- */
+  /* Grid and flex children default to min-width:auto, which means a wide table
+     pushes its parent wide instead of scrolling inside .table-wrap. Zeroing it
+     is what makes horizontal scrolling behave on a 390px phone across every
+     page, not just the one where the bug was first noticed. */
+  .grid > *,
+  .flex > * {
+    min-width: 0;
+  }
+
   .table-wrap {
     @apply w-full overflow-x-auto;
   }

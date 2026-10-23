@@ -12,7 +12,7 @@ Function.
 | --- | --- | --- |
 | Admin (agency) | Supabase Auth session from email + password, optional MFA / magic link. A lookup code identifies the account, never authenticates it. | `public.is_admin()` re-read server-side in RLS and inside every RPC; the browser cannot pass a role. |
 | Client | Access code (5–20 A–Z/0–9) exchanged for a session by `access-code-login` | bcrypt hash in `client_access_codes`, verified in `rpc_redeem_access_code` (SECURITY DEFINER, service role only), then a single-use magic-link token hash. |
-| Anonymous | none | `anon` has **no** table privileges; the only callable endpoint is `access-code-login`. |
+| Anonymous | none | `anon` has **no** table privileges; the only callable endpoint is `access-code-login`, and it answers only origins listed in `APP_ORIGINS`. |
 | Scheduler | `x-cron-secret` or service key | checked inside `send-reminders` before any query. |
 
 Client sessions carry **no** client id of their own choosing. `current_client_id()`
@@ -30,6 +30,10 @@ succeed. If the lookup code leaks, an attacker learns one address.
 
 - **RLS on every table** (`supabase/migrations/0002_rls.sql`). Row-level, not
   column-level: any field a client can read is a field they are allowed to read.
+- **Deactivation is authoritative.** `is_admin()` requires an *active* profile
+  and only then considers the `user_roles` grant, so deactivating an admin
+  revokes authorization through both paths at once. `rpc_set_admin_active()`
+  additionally clears the role row, so re-activation is deliberate.
 - **Internal notes are a separate table.** `public.internal_notes` has no client
   policy at all, because RLS filters rows, not columns — an `internal_notes`
   column on `clients` would be readable by the client whose row it describes.
@@ -42,9 +46,19 @@ succeed. If the lookup code leaks, an attacker learns one address.
   `project_updates.client_visible`, `calendar_events.client_visible` all default
   to off/false; a client only ever sees rows flagged for them *and* belonging to
   their own client id.
-- **Money is only written through RPCs.** `payments` has an admin policy, but the
-  supported path is `rpc_record_payment`, which locks the invoice row, rejects
-  overpayment, recomputes the status and writes an audit row in one transaction.
+- **Money is only written through RPCs — and the tables enforce it.**
+  `payments`, `receipts`, `document_sequences` and `audit_logs` have their
+  INSERT/UPDATE/DELETE/DELETE privileges **revoked from `authenticated`**
+  (migration 0007). Only `SELECT` remains, so an admin session using PostgREST
+  or supabase-js directly cannot insert a payment, edit a receipt snapshot,
+  delete financial history or seed the numbering sequence. The RPCs are
+  SECURITY DEFINER and run as the schema owner, so they are unaffected.
+  `rpc_record_payment` locks the invoice row, rejects overpayment, recomputes
+  the status and writes an audit row in one transaction.
+- **Invoice status is derived, never supplied.** A trigger recomputes the stored
+  status from the payments on every write, so nobody can mark an unpaid invoice
+  `paid` and have it read as revenue. `cancelled` is the one status an admin may
+  set deliberately.
 - **Receipt numbers cannot collide.** `next_document_number()` increments a row
   in `document_sequences` with an `ON CONFLICT … DO UPDATE` returning the new
   value, which serialises concurrent issuers. A payment can have exactly one
@@ -59,6 +73,11 @@ succeed. If the lookup code leaks, an attacker learns one address.
   exists only in the request that creates it and in the agency's own records.
 - Rotating a code revokes the old row (`is_revoked`, `rotated_at`) rather than
   overwriting it, so the audit trail survives.
+- Codes carry an optional hard expiry (`expires_at`, admin-only via
+  `rpc_set_client_code_expiry`). An expired code is treated exactly like an
+  unknown one.
+- A code is also refused when the linked profile is inactive, so deactivating a
+  portal identity works even if nobody rotated the code.
 - No password is ever created for a client account. There is nothing to phish
   beyond a 5-character code, which is rate-limited.
 - `service_role` appears only inside `supabase/functions/**`. It is never read
@@ -70,14 +89,31 @@ succeed. If the lookup code leaks, an attacker learns one address.
 ## Rate limiting and abuse
 
 `access_attempts` records every redemption with outcome (`ok`, `bad_code`,
-`revoked`, `rate_limited`, `admin_lookup`) and a 3-character code hint.
+`rate_limited`, `access_disabled`, `admin_lookup`), a 3-character code hint and
+the kind (`client` / `admin`). Every counter is scoped; **there is no global
+counter**, because a single unauthenticated caller must never be able to deny
+service to a legitimate user.
 
-- 8 failed attempts per IP **or** per code prefix per 10 minutes → `rate_limited`.
+| Surface | Per IP | Per code prefix | Window |
+| --- | --- | --- | --- |
+| Client portal codes | 8 failures | 30 failures | 10 minutes |
+| Admin lookup codes | 10 failures | 40 failures | 10 minutes |
+
+The per-prefix ceiling is intentionally far above the per-IP one: it stops
+distributed guessing of one code without letting one attacker lock out a shared
+prefix. An earlier design keyed the admin limiter on the constant string `ADI`,
+which meant ten bad requests from anywhere locked out **every** administrator;
+that is fixed and covered by a test asserting a second IP still succeeds.
+
 - Unknown, malformed and revoked codes return the same message, so the endpoint
   cannot be used to discover which codes exist.
 - A code that is valid but belongs to a deactivated client returns
   `access_disabled` — the code is genuine, so telling the client to contact the
   agency is more useful than pretending it does not exist.
+- Client IPs come from `cf-connecting-ip` (set by the edge network and not
+  client-controlled) or the *last* hop of `x-forwarded-for`, never the first
+  hop the caller can forge. The per-prefix bucket is the real backstop if an IP
+  is spoofed.
 
 ## Audit trail
 
@@ -116,7 +152,10 @@ single admin `profile`.
 
 | Threat | Mitigation |
 | --- | --- |
-| Guessing a 5-character code | bcrypt + 8 attempts / 10 min per IP and per prefix; 36⁵ space; codes are rotated when a client leaves. |
+| Guessing a 5-character code | bcrypt + 8 attempts / 10 min per IP and 30 per prefix; 36⁵ space; codes are rotated when a client leaves and can be given an expiry. |
+| Direct financial writes through the API | Table privileges revoked for `authenticated`; only SECURITY DEFINER RPCs can write payments/receipts/sequences. |
+| Forged invoice status | A trigger derives status from payments on every write. |
+| Admin lockout via the login limiter | Every rate-limit counter is per-IP or per-prefix; no global bucket exists. |
 | Reading another client's invoices | RLS `is_client_of(client_id)` on every billing table; the portal never filters in the browser only. |
 | Forging an admin role | Role lives in `profiles`/`user_roles`, read through SECURITY DEFINER helpers; client-side claims are ignored. |
 | Overpaying an invoice to fake revenue | Invoice row locked, `paid + amount > total` rejected, status recomputed by trigger. |

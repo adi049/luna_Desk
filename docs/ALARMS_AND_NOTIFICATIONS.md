@@ -65,6 +65,26 @@ ring the same occurrence. `MISS_WINDOW_MINUTES = 10` in `src/lib/reminders.ts`
 is the cut-off between "ringing now" and "missed" — so restoring a tab after a
 two-hour gap shows one missed entry instead of eight stacked alarms.
 
+## Duplicate delivery
+
+One reminder occurrence must ring exactly once. Three separate mechanisms
+guarantee that, because each covers a different failure mode:
+
+| Mechanism | Covers |
+| --- | --- |
+| `reminders.fired_at` + the scan filter `fired_at is null` | The same occurrence is never re-selected on the next run |
+| `reminder_deliveries` unique `(reminder_id, occurrence)` claimed **before** any send | Two overlapping scheduler runs, or a rerun after a crash |
+| `notifications.dedupe_key` unique `(user_id, dedupe_key)` | A second durable alert row for the same occurrence |
+
+The claim is taken first (`rpc_claim_reminder`), and only the caller that wins
+it pushes. A claim that fails to deliver is recorded with its error
+(`rpc_mark_reminder_delivery`) rather than being retried invisibly, so a broken
+push subscription is visible instead of silently re-firing.
+
+In the browser, `ReminderWatcher` keys its in-flight set on
+`reminder.id + occurrence`, so the same occurrence cannot ring twice while a
+repeating reminder can still ring again tomorrow.
+
 ## Push architecture
 
 ```
@@ -122,6 +142,14 @@ On load, `ReminderWatcher` and the Reminders page compare `remind_at` with now:
 `none`, `daily`, `weekly`, `monthly`, `yearly`, with an optional end date. Repeat
 arithmetic happens in the user's `profiles.timezone`, so a 09:00 reminder stays
 09:00 across a DST change instead of drifting an hour.
+
+## What this implementation does not do
+
+- It does not ring a loud alarm from a closed browser. No web API can.
+- It does not retry a failed push automatically; the failure is recorded and the
+  reminder remains visible in-app, which is the reliable channel.
+- It does not treat a notification as proof of delivery: the OS may suppress it
+  (Focus modes, Do Not Disturb, muted app) and there is no reliable read receipt.
 
 ## What to tell a client
 

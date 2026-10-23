@@ -70,10 +70,14 @@ export default function ProjectDetailPage() {
   };
 
   const toggleVisibility = async (update: ProjectUpdate) => {
-    await adapter.update<ProjectUpdate>('project_updates', update.id, { client_visible: !update.client_visible });
-    refreshUpdates();
-    invalidate();
-    toast.success(update.client_visible ? 'Update hidden from the client' : 'Update shared with the client');
+    try {
+      await adapter.update<ProjectUpdate>('project_updates', update.id, { client_visible: !update.client_visible });
+      refreshUpdates();
+      invalidate();
+      toast.success(update.client_visible ? 'Update hidden from the client' : 'Update shared with the client');
+    } catch (err) {
+      toast.error('Could not change visibility', err instanceof Error ? err.message : undefined);
+    }
   };
 
   const deleteProject = async () => {

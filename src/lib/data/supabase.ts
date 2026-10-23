@@ -98,6 +98,58 @@ async function attachNotes<T>(table: string, rows: T[]): Promise<T[]> {
   })) as unknown as T[];
 }
 
+
+/**
+ * RPC bridge.
+ *
+ * The UI speaks in short symbolic names ('record_payment'); Postgres exposes
+ * `rpc_*` functions with `p_`-prefixed parameters. Without this mapping the
+ * browser asked PostgREST for functions that do not exist, so every payment,
+ * receipt and portal action failed in live mode while working in the demo.
+ * Keeping the translation in one table makes the contract explicit and testable.
+ */
+interface RpcBinding {
+  /** SQL function in public, when the operation is a database transaction. */
+  sql?: string;
+  /** Edge Function, when the operation needs the Auth Admin API. */
+  edge?: { name: string; action: string };
+  toArgs: (args: Row) => Row;
+}
+
+const RPC_BINDINGS: Record<Exclude<RpcName, 'create_client_portal'>, RpcBinding> = {
+  record_payment: {
+    sql: 'rpc_record_payment',
+    toArgs: (a) => ({
+      p_invoice_id: a.invoice_id,
+      p_amount_minor: a.amount_minor,
+      p_paid_at: a.paid_at ?? null,
+      p_method: a.method ?? 'upi',
+      p_reference: a.reference ?? null,
+      p_notes: a.notes ?? null,
+    }),
+  },
+  void_payment: {
+    sql: 'rpc_void_payment',
+    toArgs: (a) => ({ p_payment_id: a.payment_id, p_reason: a.reason ?? null }),
+  },
+  issue_receipt: {
+    sql: 'rpc_issue_receipt',
+    toArgs: (a) => ({ p_payment_id: a.payment_id, p_notes: a.notes ?? null }),
+  },
+  change_client_access_code: {
+    sql: 'rpc_change_client_access_code',
+    toArgs: (a) => ({ p_client_id: a.client_id, p_code: a.code }),
+  },
+  revoke_client_access: {
+    sql: 'rpc_revoke_client_access',
+    toArgs: (a) => ({ p_client_id: a.client_id, p_reason: a.reason ?? null }),
+  },
+  refresh_invoice_status: {
+    sql: 'rpc_refresh_invoice_status',
+    toArgs: (a) => ({ p_invoice_id: a.invoice_id }),
+  },
+};
+
 export class SupabaseAdapter implements DataAdapter {
   readonly mode = 'live' as const;
 
@@ -151,7 +203,35 @@ export class SupabaseAdapter implements DataAdapter {
   }
 
   async rpc<T>(fn: RpcName, args: Row = {}): Promise<T> {
-    const { data, error } = await client().rpc(fn, args);
+    // Creating (or re-creating) a portal identity needs the Auth Admin API, so
+    // it is an Edge Function. With a code it provisions; without one it
+    // re-enables an existing portal.
+    if (fn === 'create_client_portal') {
+      if (!args.code) {
+        const { data, error } = await client().rpc('rpc_reactivate_client_portal', {
+          p_client_id: args.client_id,
+        });
+        if (error) throw new Error(error.message);
+        return data as T;
+      }
+      const { data, error } = await client().functions.invoke('admin-clients', {
+        body: {
+          action: 'create_portal',
+          client_id: args.client_id,
+          code: args.code,
+          email: args.email ?? null,
+          full_name: args.full_name ?? null,
+        },
+      });
+      if (error) throw new Error(await describeFunctionError(error));
+      const body = data as { ok?: boolean; error?: string; message?: string };
+      if (!body?.ok) throw new Error(body?.message ?? 'The portal could not be created.');
+      return body as T;
+    }
+
+    const binding = RPC_BINDINGS[fn];
+    if (!binding?.sql) throw new Error(`No server binding for ${fn}`);
+    const { data, error } = await client().rpc(binding.sql, binding.toArgs(args));
     if (error) throw new Error(error.message);
     return data as T;
   }
@@ -170,6 +250,22 @@ export class SupabaseAdapter implements DataAdapter {
     const { data } = client().storage.from('branding').getPublicUrl(path);
     return data.publicUrl;
   }
+}
+
+
+/** Turn a supabase-js function error (which hides the response body) into text. */
+async function describeFunctionError(error: unknown): Promise<string> {
+  const ctx = (error as { context?: Response }).context;
+  if (ctx && typeof ctx.json === 'function') {
+    try {
+      const body = (await ctx.clone().json()) as { message?: string; error?: string };
+      if (body?.message) return body.message;
+      if (body?.error) return body.error;
+    } catch {
+      /* fall through to the generic message */
+    }
+  }
+  return error instanceof Error ? error.message : 'The request failed.';
 }
 
 let cachedUserId: string | null = null;

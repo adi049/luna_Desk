@@ -165,10 +165,14 @@ export default function NotesPage() {
   };
 
   const togglePin = async (note: Note) => {
-    const updated = await adapter.update<Note>('notes', note.id, { is_pinned: !note.is_pinned });
-    refresh();
-    invalidate();
-    toast.success(updated.is_pinned ? 'Note pinned' : 'Note unpinned');
+    try {
+      const updated = await adapter.update<Note>('notes', note.id, { is_pinned: !note.is_pinned });
+      refresh();
+      invalidate();
+      toast.success(updated.is_pinned ? 'Note pinned' : 'Note unpinned');
+    } catch (err) {
+      toast.error('Could not pin the note', err instanceof Error ? err.message : undefined);
+    }
   };
 
   const toggleArchive = async (note: Note) => {

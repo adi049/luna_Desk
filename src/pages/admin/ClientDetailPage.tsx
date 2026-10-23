@@ -143,7 +143,7 @@ export default function ClientDetailPage() {
     setBusy(true);
     try {
       await adapter.rpc('create_client_portal', { client_id: client.id });
-      toast.success('Portal access restored', 'Issue a fresh code from Portal access if needed.');
+      toast.success('Portal access restored', 'The existing code works again.');
       refresh();
       invalidate();
     } catch (err) {
@@ -702,8 +702,17 @@ function PortalAccessDrawer({
     }
     setBusy(true);
     try {
-      await adapter.rpc('create_client_portal', { client_id: client.id, code: normalised });
-      await adapter.rpc('change_client_access_code', { client_id: client.id, code: normalised });
+      if (client.portal_status === 'active') {
+        // Existing portal: rotate the code in place.
+        await adapter.rpc('change_client_access_code', { client_id: client.id, code: normalised });
+      } else {
+        // First portal (or one that was revoked): provision identity + code.
+        await adapter.rpc('create_client_portal', {
+          client_id: client.id,
+          code: normalised,
+          email: client.email ?? undefined,
+        });
+      }
       setGenerated(normalised);
       toast.success(
         client.portal_status === 'active' ? 'Access code updated' : 'Portal created',

@@ -31,6 +31,27 @@ jobs:
       - name: Typecheck
         run: npx tsc --noEmit
 
+      - name: RPC contract (browser bridge vs SQL)
+        run: node scripts/check-rpc-contract.mjs
+
+      # Fail here, with a readable message, instead of deploying a bundle that
+      # boots to an error screen. Keep these two repository secrets configured.
+      - name: Require live Supabase configuration
+        run: |
+          missing=0
+          if [ -z "${VITE_SUPABASE_URL:-}" ]; then echo "::error::Repository secret VITE_SUPABASE_URL is not set (Settings → Secrets and variables → Actions)."; missing=1; fi
+          if [ -z "${VITE_SUPABASE_ANON_KEY:-}" ]; then echo "::error::Repository secret VITE_SUPABASE_ANON_KEY is not set (Settings → Secrets and variables → Actions)."; missing=1; fi
+          if [ "$missing" = "1" ]; then
+            echo "A live deployment needs both values; refusing to publish a broken app."
+            exit 1
+          fi
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+
+      - name: Secret scan of the tree
+        run: node scripts/scan-secrets.mjs
+
       # Project pages are served from /<repo>/, user pages and custom domains
       # from /. Override by setting BASE_PATH in this file.
       - name: Build

@@ -187,10 +187,12 @@ begin
     raise exception 'Cannot issue a receipt for a voided payment' using errcode = 'P0001';
   end if;
 
+  -- Idempotent by design: a double-submit (or a retry after a timeout that
+  -- actually succeeded) returns the existing document instead of erroring or
+  -- minting a second number for one payment.
   select * into v_receipt from public.receipts where payment_id = p_payment_id;
   if found then
-    raise exception 'A receipt already exists for this payment: %', v_receipt.receipt_number
-      using errcode = '23505';
+    return v_receipt;
   end if;
 
   select * into v_inv from public.invoices where id = v_pay.invoice_id;

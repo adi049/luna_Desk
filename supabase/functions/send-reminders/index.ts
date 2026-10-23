@@ -8,14 +8,10 @@
 // notification centre are the source of truth; this job only improves
 // punctuality.
 //
-// What the job does, once per minute:
-//   1. finds reminders whose next occurrence is due (or was missed),
-//   2. writes a durable notification row (deduped per occurrence),
-//   3. pushes to every stored subscription for that user,
-//   4. advances repeating reminders to their next occurrence.
-//
-// Auth: a scheduler must present `x-cron-secret: $CRON_SECRET` (or the
-// service-role key as a bearer token). It is never callable by a browser.
+// Delivery is claimed before it is attempted (rpc_claim_reminder). The
+// (reminder_id, occurrence) unique key is the mutex, so overlapping scheduler
+// runs — or a rerun after a partial failure — cannot push the same occurrence
+// twice. A claim that fails to deliver is recorded, not retried silently.
 // =============================================================================
 
 import { json, preflight } from '../_shared/http.ts';
@@ -33,6 +29,8 @@ interface Reminder {
   repeat_until: string | null;
   alarm_enabled: boolean;
 }
+
+const WORKER = `scheduler:${crypto.randomUUID().slice(0, 8)}`;
 
 /** Add one repeat interval in the user's timezone, so DST does not drift. */
 const nextOccurrence = (iso: string, repeat: Reminder['repeat'], timeZone: string): Date => {
@@ -88,7 +86,12 @@ Deno.serve(async (req) => {
   const serviceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '';
   const presented = req.headers.get('x-cron-secret') ?? '';
   const bearer = (req.headers.get('authorization') ?? '').replace(/^Bearer\s+/i, '');
-  if (!(secret && presented === secret) && !(serviceKey && bearer === serviceKey)) {
+
+  // Compared as presented, so an empty configured secret never matches.
+  const authorised =
+    (secret.length > 0 && presented === secret) ||
+    (serviceKey.length > 0 && bearer === serviceKey);
+  if (!authorised) {
     return json({ ok: false, error: 'forbidden' }, 403, origin);
   }
 
@@ -104,10 +107,14 @@ Deno.serve(async (req) => {
   const now = new Date();
   const horizon = new Date(now.getTime() + 60_000).toISOString();
 
+  // Only rows that have not already been delivered. One-time reminders carry
+  // fired_at after delivery, so they drop out permanently instead of being
+  // re-selected on every run (the previous duplicate-delivery bug).
   const { data: due, error } = await supabase
     .from('reminders')
     .select('id, owner_id, title, description, remind_at, snoozed_until, repeat, repeat_until, alarm_enabled')
     .eq('is_dismissed', false)
+    .is('fired_at', null)
     .lte('remind_at', horizon)
     .order('remind_at', { ascending: true })
     .limit(200);
@@ -119,29 +126,71 @@ Deno.serve(async (req) => {
 
   let notified = 0;
   let pushed = 0;
+  let skipped = 0;
+  let failed = 0;
 
   for (const reminder of (due ?? []) as Reminder[]) {
     const occurrence = reminder.snoozed_until ?? reminder.remind_at;
-    if (new Date(occurrence) > new Date(horizon)) continue;
 
-    const dedupeKey = `reminder:${reminder.id}:${occurrence}`;
+    // A snooze pushes the occurrence into the future; leave it for later.
+    if (new Date(occurrence) > new Date(horizon)) {
+      skipped += 1;
+      continue;
+    }
+
+    // Claim first. If another run already owns this occurrence, do nothing.
+    const { data: claimed, error: claimError } = await supabase.rpc('rpc_claim_reminder', {
+      p_reminder_id: reminder.id,
+      p_occurrence: occurrence,
+      p_worker: WORKER,
+    });
+
+    if (claimError) {
+      console.error('claim failed', reminder.id, claimError.message);
+      failed += 1;
+      continue;
+    }
+    if (claimed !== true) {
+      skipped += 1;
+      continue;
+    }
+
+    // Respect the user's preference: no preference row is treated as the
+    // conservative default (in-app only, no system notification).
+    const { data: prefs } = await supabase
+      .from('notification_preferences')
+      .select('browser_notifications, timezone')
+      .eq('user_id', reminder.owner_id)
+      .maybeSingle();
+
     const { error: insertError } = await supabase.from('notifications').insert({
       user_id: reminder.owner_id,
       kind: 'reminder',
       title: reminder.title,
       body: reminder.description ?? 'Scheduled reminder',
       link: '/reminders',
-      dedupe_key: dedupeKey,
+      dedupe_key: `reminder:${reminder.id}:${occurrence}`,
     });
 
-    // 23505 = the occurrence was already notified (another tab, earlier run).
-    if (insertError && insertError.code !== '23505') {
+    // 23505 means the occurrence was already recorded (a previous partial run);
+    // the claim still owns delivery, so pushing once more is safe but pointless.
+    const alreadyRecorded = insertError?.code === '23505';
+    if (insertError && !alreadyRecorded) {
       console.error('notification insert failed', insertError.message);
+      await supabase.rpc('rpc_mark_reminder_delivery', {
+        p_reminder_id: reminder.id,
+        p_occurrence: occurrence,
+        p_delivered: false,
+        p_error: `notification insert: ${insertError.message}`,
+      });
+      failed += 1;
       continue;
     }
     if (!insertError) notified += 1;
 
-    if (pushEnabled) {
+    let pushError: string | null = null;
+
+    if (pushEnabled && prefs?.browser_notifications !== false && !alreadyRecorded) {
       const { data: subs } = await supabase
         .from('push_subscriptions')
         .select('id, endpoint, p256dh, auth')
@@ -154,7 +203,7 @@ Deno.serve(async (req) => {
             JSON.stringify({
               title: reminder.title,
               body: reminder.description ?? 'LunaDesk reminder',
-              tag: dedupeKey,
+              tag: `reminder:${reminder.id}:${occurrence}`,
               url: '/#/reminders',
               requireInteraction: true,
             }),
@@ -163,36 +212,69 @@ Deno.serve(async (req) => {
         } catch (err) {
           const status = (err as { statusCode?: number }).statusCode;
           if (status === 404 || status === 410) {
+            // The endpoint is gone (uninstalled, permission reset, expired).
             await supabase.from('push_subscriptions').delete().eq('id', sub.id);
           } else {
+            pushError = `push ${status ?? 'error'}: ${(err as Error).message}`;
             console.error('push failed', status, (err as Error).message);
           }
         }
       }
     }
 
+    // Persist the new state only after the claim is owned, so a crash between
+    // claim and update leaves a claim row rather than a silent re-send.
     if (reminder.repeat === 'none') {
-      await supabase.from('reminders').update({ fired_at: now.toISOString(), snoozed_until: null }).eq('id', reminder.id);
+      await supabase
+        .from('reminders')
+        .update({ fired_at: now.toISOString(), snoozed_until: null })
+        .eq('id', reminder.id);
     } else {
-      const { data: profile } = await supabase
-        .from('profiles')
-        .select('timezone')
-        .eq('id', reminder.owner_id)
-        .maybeSingle();
+      // Advance past "now" in one step: after downtime we notify once for the
+      // backlog instead of replaying every missed occurrence.
+      let next = nextOccurrence(reminder.remind_at, reminder.repeat, prefs?.timezone ?? 'Asia/Kolkata');
+      let guard = 0;
+      while (next.getTime() <= now.getTime() && guard < 400) {
+        next = nextOccurrence(next.toISOString(), reminder.repeat, prefs?.timezone ?? 'Asia/Kolkata');
+        guard += 1;
+      }
 
-      const next = nextOccurrence(reminder.remind_at, reminder.repeat, profile?.timezone ?? 'Asia/Kolkata');
       const expired = reminder.repeat_until && next.toISOString().slice(0, 10) > reminder.repeat_until;
 
       await supabase
         .from('reminders')
         .update(
           expired
+            // Series finished: terminal state, same as a one-time reminder.
             ? { fired_at: now.toISOString(), snoozed_until: null }
-            : { remind_at: next.toISOString(), fired_at: now.toISOString(), snoozed_until: null },
+            // Next occurrence is pending, so clear fired_at (it means "this
+            // occurrence was delivered", not "this reminder is finished").
+            : { remind_at: next.toISOString(), fired_at: null, snoozed_until: null },
         )
         .eq('id', reminder.id);
     }
+
+    await supabase.rpc('rpc_mark_reminder_delivery', {
+      p_reminder_id: reminder.id,
+      p_occurrence: occurrence,
+      p_delivered: pushError === null,
+      p_error: pushError,
+    });
+    if (pushError) failed += 1;
   }
 
-  return json({ ok: true, checked: due?.length ?? 0, notified, pushed, push_enabled: pushEnabled }, 200, origin);
+  return json(
+    {
+      ok: true,
+      checked: due?.length ?? 0,
+      notified,
+      pushed,
+      skipped,
+      failed,
+      push_enabled: pushEnabled,
+      worker: WORKER,
+    },
+    200,
+    origin,
+  );
 });

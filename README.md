@@ -50,11 +50,18 @@ finances.
 ## Verification
 
 ```bash
-npm run typecheck                      # strict TypeScript, no unused imports
-npm run build                          # production bundle
-scripts/verify-migrations.sh           # apply every migration to a scratch
+npm run verify                         # tsc + RPC contract + secret scan
+npm run build                          # production bundle (refuses live build
+                                       # without Supabase env — by design)
+npm run verify:db                      # apply every migration to a scratch
                                        # Postgres and run the RLS/RPC suite
 ```
+
+`npm run check:rpc` is worth calling out: it parses the migrations and the
+Supabase adapter's binding table and fails if the browser calls a function that
+does not exist or passes a parameter it does not take. The audit found exactly
+that class of bug (the UI called `record_payment`; SQL defined
+`rpc_record_payment`), which demo mode hid completely.
 
 `scripts/verify-migrations.sh` recreates a throwaway database
 (`lunadesk_verify`), installs a small Supabase shim (auth schema, roles,
@@ -66,6 +73,22 @@ numbering, void-and-recompute, archive guards, access-code rate limiting and
 revocation. It refuses to pass silently — an errored assertion aborts the run.
 
 ---
+
+### If the build runs out of memory
+
+`vite build` serialises sourcemaps and the three.js chunk is large, so on a
+machine with ~2 GB free it can exhaust Node's default heap. Either build the
+way CI does (no sourcemaps):
+
+```bash
+CI=true npm run build
+```
+
+or cap the heap explicitly:
+
+```bash
+NODE_OPTIONS=--max-old-space-size=1024 npm run build
+```
 
 ## Layout
 
@@ -106,6 +129,8 @@ docs/                     setup, architecture, security, alarms & notifications
 - **[docs/ALARMS_AND_NOTIFICATIONS.md](docs/ALARMS_AND_NOTIFICATIONS.md)** —
   what reminders actually guarantee (and what they cannot), plus the push
   architecture.
+- **[docs/AUDIT.md](docs/AUDIT.md)** — the pre-deployment audit: what was
+  broken, what was fixed, what was actually tested.
 
 ## Design
 

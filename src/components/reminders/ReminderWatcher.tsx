@@ -22,7 +22,7 @@ const POLL_MS = 10_000;
 export function ReminderWatcher({ prefs }: { prefs?: NotificationPreferences }) {
   const adapter = useData().adapters.data;
   const { invalidate } = useData();
-  const { profile } = useAuth();
+  const { profile, isAdmin } = useAuth();
   const toast = useToast();
   const { data: reminders, refresh } = useCollection<Reminder>('reminders');
   const [active, setActive] = useState<Reminder[]>([]);
@@ -34,11 +34,16 @@ export function ReminderWatcher({ prefs }: { prefs?: NotificationPreferences }) 
   const tone = (prefs?.alarm_sound_name as AlarmTone) ?? 'pulse';
   const browserNotifs = prefs?.browser_notifications ?? false;
 
+  // Keyed by reminder *and* occurrence: a repeating reminder must be able to
+  // ring again tomorrow, while the same occurrence can never ring twice.
+  const occurrenceKey = (r: Reminder) => `${r.id}:${r.snoozed_until ?? r.remind_at}`;
+
   const fire = useCallback(
     async (reminder: Reminder) => {
-      if (handled.current.has(reminder.id)) return;
-      handled.current.add(reminder.id);
-      setActive((prev) => [...prev, reminder]);
+      const key = occurrenceKey(reminder);
+      if (handled.current.has(key)) return;
+      handled.current.add(key);
+      setActive((prev) => (prev.some((r) => r.id === reminder.id) ? prev : [...prev, reminder]));
 
       if (reminder.alarm_enabled && soundEnabled) {
         try {
@@ -61,8 +66,12 @@ export function ReminderWatcher({ prefs }: { prefs?: NotificationPreferences }) 
       // same occurrence, and record one durable notification per occurrence.
       try {
         await adapter.update<Reminder>('reminders', reminder.id, { fired_at: new Date().toISOString() });
+
+        // Same key the scheduler uses, so the two paths cannot create two rows
+        // for one occurrence.
+        const dedupeKey = `reminder:${reminder.id}:${reminder.snoozed_until ?? reminder.remind_at}`;
         const existing = await adapter.list<{ id: string }>('notifications', {
-          where: { user_id: profile?.id ?? '', dedupe_key: `reminder:${reminder.id}:${reminder.remind_at}` },
+          where: { user_id: profile?.id ?? '', dedupe_key: dedupeKey },
           limit: 1,
         });
         if (!existing.length && profile) {
@@ -72,8 +81,9 @@ export function ReminderWatcher({ prefs }: { prefs?: NotificationPreferences }) 
             kind: 'reminder',
             title: reminder.title,
             body: reminder.description,
-            link: '/admin/reminders',
-            dedupe_key: `reminder:${reminder.id}:${reminder.remind_at}`,
+            // Clients cannot open /admin; send them to their own reminder list.
+            link: isAdmin ? '/admin/reminders' : '/portal/reminders',
+            dedupe_key: dedupeKey,
           });
         }
         invalidate();
@@ -81,7 +91,7 @@ export function ReminderWatcher({ prefs }: { prefs?: NotificationPreferences }) 
         /* Keep the alarm visible even if persistence fails. */
       }
     },
-    [adapter, browserNotifs, invalidate, profile, soundEnabled, tone, volume],
+    [adapter, browserNotifs, invalidate, isAdmin, profile, soundEnabled, tone, volume],
   );
 
   useEffect(() => {
@@ -135,7 +145,7 @@ export function ReminderWatcher({ prefs }: { prefs?: NotificationPreferences }) 
     } catch {
       toast.error('Could not update the reminder', 'It will appear again until the change is saved.');
     }
-    handled.current.delete(reminder.id);
+    handled.current.delete(occurrenceKey(reminder));
     refresh();
     invalidate();
   };
@@ -150,7 +160,7 @@ export function ReminderWatcher({ prefs }: { prefs?: NotificationPreferences }) 
     } catch {
       toast.error('Could not snooze the reminder');
     }
-    handled.current.delete(reminder.id);
+    handled.current.delete(occurrenceKey(reminder));
     refresh();
     invalidate();
   };

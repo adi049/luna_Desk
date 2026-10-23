@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Download, Plus, Receipt as ReceiptIcon, Undo2, Wallet } from 'lucide-react';
 import {
@@ -66,7 +66,12 @@ export default function PaymentsPage() {
   const monthTotal = active.filter((p) => p.paid_at.slice(0, 7) === thisMonth).reduce((s, p) => s + p.amount_minor, 0);
   const filteredTotal = filtered.reduce((s, p) => s + p.amount_minor, 0);
 
+  // One in-flight request per payment: double-clicking must not fire two calls
+  // (the RPC is idempotent, but two spinners and two toasts still read as a bug).
+  const issuing = useRef<Set<string>>(new Set());
   const issueReceipt = async (payment: Payment) => {
+    if (issuing.current.has(payment.id)) return;
+    issuing.current.add(payment.id);
     try {
       const receipt = await adapter.rpc<Receipt>('issue_receipt', { payment_id: payment.id });
       toast.success('Receipt issued', receipt.receipt_number);
@@ -74,6 +79,8 @@ export default function PaymentsPage() {
       invalidate();
     } catch (err) {
       toast.error('Could not issue a receipt', err instanceof Error ? err.message : undefined);
+    } finally {
+      issuing.current.delete(payment.id);
     }
   };
 

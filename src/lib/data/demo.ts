@@ -180,26 +180,34 @@ export function invoicePaidMinor(invoiceId: string): number {
     .reduce((a, p) => a + Number(p.amount_minor), 0);
 }
 
+/**
+ * Mirror of the SQL status guard (migration 0007) and finance.ts#effectiveStatus.
+ * Precedence: cancelled > paid > overdue > partially_paid > pending. Keeping one
+ * definition on each side prevents the demo from disagreeing with production.
+ */
 function recomputeInvoiceStatus(invoiceId: string) {
   const inv = database().tables.invoices.find((i) => i.id === invoiceId);
   if (!inv || inv.status === 'cancelled') return;
   const paid = invoicePaidMinor(invoiceId);
   const total = Number(inv.total_minor);
-  const today = new Date().toISOString().slice(0, 10);
-  let status: string;
-  if (paid >= total) status = 'paid';
-  else if (paid > 0) status = 'partially_paid';
-  else status = inv.due_date && String(inv.due_date) < today ? 'overdue' : 'pending';
-  if (paid > 0 && paid < total && inv.due_date && String(inv.due_date) < today) status = 'overdue';
-  inv.status = status;
+  const overdue = Boolean(inv.due_date) && String(inv.due_date) < new Date().toISOString().slice(0, 10);
+  inv.status = paid >= total ? 'paid' : overdue ? 'overdue' : paid > 0 ? 'partially_paid' : 'pending';
   inv.updated_at = nowIso();
 }
 
 function nextSequenceNumber(table: TableName, column: string, prefix: string): string {
   const year = new Date().getFullYear();
+  const marker = `${prefix}-${year}-`;
   const rows = database().tables[table] ?? [];
-  const count = rows.filter((r) => String(r[column] ?? '').includes(`-${year}-`)).length + 1;
-  return `${prefix}-${year}-${String(count).padStart(4, '0')}`;
+  // Highest existing number + 1. Counting rows would reuse a number after a
+  // deletion, which is exactly what document numbering must never do.
+  const highest = rows.reduce((max, row) => {
+    const value = String(row[column] ?? '');
+    if (!value.startsWith(marker)) return max;
+    const n = Number(value.slice(marker.length));
+    return Number.isFinite(n) && n > max ? n : max;
+  }, 0);
+  return `${marker}${String(highest + 1).padStart(4, '0')}`;
 }
 
 function appendAudit(action: string, entity: string, entityId: string, before: unknown, after: unknown) {
@@ -325,6 +333,9 @@ export class DemoAdapter implements DataAdapter {
         const invoiceId = String(args.invoice_id);
         const invoice = tables.invoices.find((i) => i.id === invoiceId);
         if (!invoice) throw new Error('Invoice not found');
+        if (invoice.status === 'cancelled') {
+          throw new Error('Cannot record a payment against a cancelled invoice');
+        }
         const amount = Number(args.amount_minor);
         if (!Number.isFinite(amount) || amount <= 0) throw new Error('Payment amount must be greater than zero');
         const paid = invoicePaidMinor(invoiceId);
@@ -372,7 +383,13 @@ export class DemoAdapter implements DataAdapter {
         payment.voided_at = nowIso();
         payment.void_reason = args.reason ?? 'Corrected by admin';
         recomputeInvoiceStatus(String(payment.invoice_id));
+        // The receipt documenting a voided payment is void too — kept, never
+        // deleted. This mirrors rpc_void_payment in SQL.
         const receipt = tables.receipts.find((r) => r.payment_id === payment.id);
+        if (receipt && !receipt.voided_at) {
+          receipt.voided_at = nowIso();
+          receipt.void_reason = payment.void_reason;
+        }
         appendAudit('payment.voided', 'payments', String(payment.id), before, payment);
         persist();
         return { payment, receipt_voided: Boolean(receipt) } as T;
@@ -387,8 +404,10 @@ export class DemoAdapter implements DataAdapter {
         const invoice = tables.invoices.find((i) => i.id === payment.invoice_id)!;
         const client = tables.clients.find((c) => c.id === payment.client_id)!;
         const items = tables.invoice_items.filter((i) => i.invoice_id === invoice.id);
+        // Payments are unshifted, so a higher index means "recorded earlier".
+        const paymentIndex = tables.payments.indexOf(payment);
         const priorPaid = tables.payments
-          .filter((p) => p.invoice_id === invoice.id && !p.voided_at && p.id !== payment.id)
+          .filter((p, index) => p.invoice_id === invoice.id && !p.voided_at && index > paymentIndex)
           .reduce((a, p) => a + Number(p.amount_minor), 0);
         const brand = tables.branding_settings[0];
         const number = nextSequenceNumber('receipts', 'receipt_number', String(brand.receipt_prefix ?? 'MBL-RCP'));
@@ -415,7 +434,10 @@ export class DemoAdapter implements DataAdapter {
             invoice_total_minor: invoice.total_minor,
             previously_paid_minor: priorPaid,
             amount_received_minor: payment.amount_minor,
-            balance_minor: Number(invoice.total_minor) - priorPaid - Number(payment.amount_minor),
+            balance_minor: Math.max(
+              0,
+              Number(invoice.total_minor) - priorPaid - Number(payment.amount_minor),
+            ),
             method: payment.method,
             reference: payment.reference,
             payment_date: payment.paid_at,
