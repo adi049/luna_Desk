@@ -737,7 +737,9 @@ this environment cannot reach. Stated as unverified, not as passing.
 - `.github/workflows/database.yml` runs the migrations, the RLS/RPC suite, the
   bootstrap test, the concurrency test and the migration-verifier meta-test on
   a `postgres:17` service container, plus typecheck, RPC contract and both
-  secret scans.
+  secret scans. It replaces the older `verify-schema.yml`, which ran the same
+  script on `postgres:15` — a needless second gate on a version that is not the
+  one Supabase runs, and one that would have passed while the 17 gate failed.
 - `.github/workflows/e2e.yml` runs the browser tests.
 - `e2e/smoke.spec.ts` + `playwright.config.ts` replace the previous ad-hoc
   Playwright session, which proved the app worked on the day but could not be
