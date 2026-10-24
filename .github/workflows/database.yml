@@ -74,7 +74,7 @@ jobs:
         run: bash scripts/test-verify-migrations.sh
 
   static:
-    name: Types, RPC contract, secrets and environment
+    name: Types, RPC contract, Edge queries, secrets and environment
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -100,3 +100,9 @@ jobs:
 
       - name: Environment validator (self-test)
         run: node scripts/check-env.mjs --self-test
+
+      - name: Edge Function queries check their errors
+        run: node scripts/check-edge-queries.mjs
+
+      - name: Edge Function query checker (self-test)
+        run: node scripts/check-edge-queries.mjs --self-test

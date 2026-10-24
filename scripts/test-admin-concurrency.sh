@@ -50,8 +50,11 @@ trap cleanup EXIT
 
 psql_x() { psql -X -q -t -A -v ON_ERROR_STOP=1 -d "$DATABASE" "$@"; }
 
-if ! psql_x -c 'select 1' >/dev/null 2>&1; then
-  echo "→ $DATABASE does not exist; creating it with scripts/verify-migrations.sh"
+# Rebuild the scratch database every run (SKIP_MIGRATE=1 opts out), so the
+# result depends on the repository rather than on an older scratch database left
+# behind by a previous round.
+if [[ "${SKIP_MIGRATE:-0}" != "1" ]]; then
+  echo "→ applying migrations to $DATABASE"
   DATABASE="$DATABASE" bash scripts/verify-migrations.sh >/dev/null 2>&1 || {
     echo "✗ could not prepare $DATABASE" >&2
     exit 1
@@ -65,10 +68,17 @@ psql_x -c "
     ('$ADMIN_B', 'race-b@example.test')
   on conflict (id) do nothing;
 
-  insert into public.profiles (id, full_name, email, role, is_active) values
-    ('$ADMIN_A', 'Race A', 'race-a@example.test', 'admin', true),
-    ('$ADMIN_B', 'Race B', 'race-b@example.test', 'admin', true)
-  on conflict (id) do update set role = 'admin', is_active = true;
+  insert into public.profiles (id, full_name, email, is_active) values
+    ('$ADMIN_A', 'Race A', 'race-a@example.test', true),
+    ('$ADMIN_B', 'Race B', 'race-b@example.test', true)
+  on conflict (id) do nothing;
+
+  -- Setting the role is an identity change, so since migration 0014 each one
+  -- needs its own authorisation — including from a test fixture.
+  select public.rpc_authorise_identity_change('$ADMIN_A', 'fixture: seed race admin A');
+  update public.profiles set role = 'admin', is_active = true where id = '$ADMIN_A';
+  select public.rpc_authorise_identity_change('$ADMIN_B', 'fixture: seed race admin B');
+  update public.profiles set role = 'admin', is_active = true where id = '$ADMIN_B';
 
   insert into public.user_roles (user_id, role) values
     ('$ADMIN_A','admin'), ('$ADMIN_B','admin')

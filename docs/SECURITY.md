@@ -113,6 +113,15 @@ succeed. If the lookup code leaks, an attacker learns one address.
   portal identity works even if nobody rotated the code.
 - No password is ever created for a client account. There is nothing to phish
   beyond a 5-character code, which is rate-limited.
+- **Identity changes are authorised, never inferred.** `profiles.role` and
+  `profiles.client_id` are the tenant boundary, so a change needs an explicit
+  signal: a transaction-local marker set by a sanctioned RPC after
+  `assert_admin()` (or by an owner-only function), or a one-shot
+  `identity_change_grants` row bound to that profile. **There is no exemption
+  for `auth.uid() is null`** — a service-role or system request without a grant
+  is refused exactly like a browser. The marker lives in the GUC
+  `lunadesk.identity_change`; it is only ever set inside a `SECURITY DEFINER`
+  function, because PostgREST exposes functions and not `set_config`.
 - **The service key is not a caller.** `service_role` bypasses RLS but it has no
   `auth.uid()`, so any RPC whose body calls `assert_admin()` or `is_client_of()`
   fails with `42501` when it is invoked with the service key. Those RPCs must run

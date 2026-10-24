@@ -50,13 +50,16 @@ begin
     (v_ua,    'a@example.test'),
     (v_ub,    'b@example.test');
 
+  perform public.rpc_authorise_identity_change(v_admin, 'fixture: promote the workspace admin');
   update public.profiles set role = 'admin', full_name = 'Studio Admin' where id = v_admin;
 
   insert into public.clients (id, name, business_name, client_code, email, status, portal_status)
   values (v_ca, 'Priya', 'Prism Studio LLP', 'PR103', 'priya@example.test', 'active', 'active'),
          (v_cb, 'Ananya', 'Ansel & Co.',   'ANS005', 'ananya@example.test', 'active', 'active');
 
+  perform public.rpc_authorise_identity_change(v_ua, 'fixture: link client A portal user');
   update public.profiles set role = 'client', client_id = v_ca where id = v_ua;
+  perform public.rpc_authorise_identity_change(v_ub, 'fixture: link client B portal user');
   update public.profiles set role = 'client', client_id = v_cb where id = v_ub;
 
   insert into public.services (id, name, category) values (v_svc, 'Social Media Marketing', 'Marketing');
@@ -440,6 +443,7 @@ end $$;
 -- inactive admin is exactly that.
 reset role;
 select set_config('request.jwt.claim.sub', '', true);
+select public.rpc_authorise_identity_change('11111111-1111-4111-8111-111111111111', 'fixture: reactivate the workspace admin');
 update public.profiles set is_active = true, role = 'admin'
  where id = '11111111-1111-4111-8111-111111111111';
 set local role authenticated;
@@ -1085,10 +1089,14 @@ insert into auth.users (id, email) values
   ('55555555-5555-4555-8555-555555555553', 'second-admin@example.test')
 on conflict do nothing;
 
+-- Identity changes are authorised one statement at a time, even for the owner.
+select public.rpc_authorise_identity_change('55555555-5555-4555-8555-555555555551', 'fixture: client-linked target profile');
 update public.profiles set role = 'client', client_id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
  where id = '55555555-5555-4555-8555-555555555551';
+select public.rpc_authorise_identity_change('55555555-5555-4555-8555-555555555552', 'fixture: plain target profile');
 update public.profiles set role = 'client', client_id = null
  where id = '55555555-5555-4555-8555-555555555552';
+select public.rpc_authorise_identity_change('55555555-5555-4555-8555-555555555553', 'fixture: second admin profile');
 update public.profiles set role = 'admin', is_active = true
  where id = '55555555-5555-4555-8555-555555555553';
 
@@ -1482,7 +1490,9 @@ insert into auth.users (id, email) values
 on conflict do nothing;
 
 -- auth.users has a handle_new_user trigger, so the profile may already exist
--- with a null client link; upsert to make the fixture deterministic.
+-- with a null client link; upsert to make the fixture deterministic. The
+-- conflict branch is an identity change, so it is authorised like any other.
+select public.rpc_authorise_identity_change('77777777-7777-4777-8777-777777777771', 'fixture: section 9 client profile');
 insert into public.profiles (id, full_name, email, role, is_active, client_id) values
   ('77777777-7777-4777-8777-777777777771', 'Linked client', 'id-client@example.test', 'client', true,
    'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
@@ -1492,6 +1502,7 @@ on conflict (id) do update
       client_id = excluded.client_id,
       is_active = true;
 
+select public.rpc_authorise_identity_change('77777777-7777-4777-8777-777777777772', 'fixture: section 9 second admin');
 insert into public.profiles (id, full_name, email, role, is_active) values
   ('77777777-7777-4777-8777-777777777772', 'Second admin', 'id-admin2@example.test', 'admin', true)
 on conflict (id) do update set role = 'admin', is_active = true;
@@ -1872,6 +1883,356 @@ begin
     'archiving a settled client revokes its portal codes');
   perform public.test_assert(v_portal = 'revoked',
     'archiving sets the portal status to revoked');
+end $$;
+
+
+-- ===========================================================================
+-- 11. Fourth-round regressions (migration 0014)
+--
+--     Each block below reproduces a defect that existed after 0013:
+--       a. rpc_attach_client_portal could not run at all (the identity guard
+--          refused the write it makes);
+--       b. the guard skipped its check when auth.uid() was null, so a
+--          service-role request changed identities freely;
+--       c. an invoice line moved to another invoice left the first invoice's
+--          totals stale;
+--       d. daily/weekly recurrence stepped the UTC clock, so a reminder drifted
+--          by an hour across a DST change.
+-- ===========================================================================
+reset role;
+select set_config('request.jwt.claim.sub', '', true);
+
+insert into auth.users (id, email) values
+  ('88888888-8888-4888-8888-888888888881', 'portal-new@example.test'),
+  ('88888888-8888-4888-8888-888888888882', 'portal-move@example.test'),
+  ('88888888-8888-4888-8888-888888888883', 'portal-admin@example.test')
+on conflict do nothing;
+
+insert into public.clients (id, name, business_name, client_code, status) values
+  ('ffffffff-ffff-4fff-8fff-fffffffffff1', 'Dst Co', 'Dst Co', 'DST001', 'active')
+on conflict (id) do nothing;
+
+-- 11a. Portal provisioning works again, and it is still admin-only ----------
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '11111111-1111-4111-8111-111111111111', true);
+do $$
+declare
+  v_code uuid;
+  v_role text;
+  v_client uuid;
+  v_audit jsonb;
+begin
+  v_code := public.rpc_attach_client_portal(
+    'ffffffff-ffff-4fff-8fff-fffffffffff1',
+    '88888888-8888-4888-8888-888888888881',
+    'PORTAL1', 'Portal access');
+
+  perform public.test_assert(v_code is not null,
+    'an administrator can provision a client portal (0013 made this impossible)');
+
+  reset role;
+  select role, client_id into v_role, v_client
+    from public.profiles where id = '88888888-8888-4888-8888-888888888881';
+
+  select after into v_audit
+    from public.audit_logs
+   where action = 'profile.identity.change'
+     and entity_id = '88888888-8888-4888-8888-888888888881'
+   order by id desc limit 1;
+
+  perform public.test_assert(v_role = 'client' and v_client = 'ffffffff-ffff-4fff-8fff-fffffffffff1',
+    'provisioning links the user to that client as a client');
+  perform public.test_assert(v_audit ->> 'authorised_by' = 'rpc',
+    'provisioning records how the identity change was authorised');
+  perform public.test_assert((v_audit ->> 'reason') like 'portal provisioning%',
+    'provisioning records why the identity change happened');
+end $$;
+
+-- 11a(ii). A non-admin cannot provision a portal.
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '88888888-8888-4888-8888-888888888881', true);
+do $$
+declare v_blocked boolean := false;
+begin
+  begin
+    perform public.rpc_attach_client_portal(
+      'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+      '55555555-5555-4555-8555-555555555552', 'SNEAK1');
+  exception when others then v_blocked := true;
+  end;
+  perform public.test_assert(v_blocked, 'a client cannot provision a portal for another client');
+end $$;
+
+-- 11a(iii). Provisioning refuses to demote an administrator.
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '11111111-1111-4111-8111-111111111111', true);
+do $$
+declare v_blocked boolean := false; v_role text;
+begin
+  begin
+    perform public.rpc_attach_client_portal(
+      'ffffffff-ffff-4fff-8fff-fffffffffff1',
+      '11111111-1111-4111-8111-111111111111', 'ADMIN1');
+  exception when others then v_blocked := true;
+  end;
+
+  reset role;
+  select role into v_role from public.profiles where id = '11111111-1111-4111-8111-111111111111';
+  perform public.test_assert(v_blocked,
+    'an administrator cannot be turned into a portal identity by provisioning');
+  perform public.test_assert(v_role = 'admin', 'the administrator is still an administrator');
+end $$;
+
+-- 11a(iv). Provisioning refuses a cross-client move; that needs the audited path.
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '11111111-1111-4111-8111-111111111111', true);
+do $$
+declare v_blocked boolean := false; v_client uuid;
+begin
+  begin
+    perform public.rpc_attach_client_portal(
+      'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+      '88888888-8888-4888-8888-888888888881', 'MOVED1');
+  exception when others then v_blocked := true;
+  end;
+
+  reset role;
+  select client_id into v_client
+    from public.profiles where id = '88888888-8888-4888-8888-888888888881';
+  perform public.test_assert(v_blocked,
+    'provisioning a user who belongs to another client is refused');
+  perform public.test_assert(v_client = 'ffffffff-ffff-4fff-8fff-fffffffffff1',
+    'the refused cross-client move changed nothing');
+end $$;
+
+-- 11b. No writer is exempt: a service-role request needs authorisation too ----
+reset role;
+select set_config('request.jwt.claim.sub', '', true);
+set local role service_role;
+do $$
+declare v_blocked boolean := false; v_client uuid;
+begin
+  begin
+    update public.profiles
+       set client_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+     where id = '88888888-8888-4888-8888-888888888881';
+  exception when others then v_blocked := true;
+  end;
+
+  reset role;
+  select client_id into v_client
+    from public.profiles where id = '88888888-8888-4888-8888-888888888881';
+  perform public.test_assert(v_blocked,
+    'a service-role request (no auth.uid()) cannot change an identity without authorisation');
+  perform public.test_assert(v_client = 'ffffffff-ffff-4fff-8fff-fffffffffff1',
+    'the refused service-role change left the client link intact');
+end $$;
+
+-- 11b(ii). The owner has no implicit bypass either.
+reset role;
+select set_config('request.jwt.claim.sub', '', true);
+do $$
+declare v_blocked boolean := false;
+begin
+  begin
+    update public.profiles set role = 'admin'
+     where id = '88888888-8888-4888-8888-888888888882';
+  exception when others then v_blocked := true;
+  end;
+  perform public.test_assert(v_blocked,
+    'even the table owner must authorise an identity change explicitly');
+end $$;
+
+-- 11b(iii). An owner authorisation is one statement, and it is audited.
+reset role;
+do $$
+declare
+  v_after  text;
+  v_audit  jsonb;
+  v_blocked boolean := false;
+begin
+  perform public.rpc_authorise_identity_change(
+    '88888888-8888-4888-8888-888888888882',
+    'support request: user belongs to the wrong studio');
+  update public.profiles set client_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+   where id = '88888888-8888-4888-8888-888888888882';
+
+  select client_id::text into v_after
+    from public.profiles where id = '88888888-8888-4888-8888-888888888882';
+
+  select after into v_audit from public.audit_logs
+   where action = 'profile.identity.change'
+     and entity_id = '88888888-8888-4888-8888-888888888882'
+   order by id desc limit 1;
+
+  perform public.test_assert(v_after = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+    'an owner-authorised identity change is applied');
+  perform public.test_assert(v_audit ->> 'authorised_by' = 'grant'
+      and (v_audit ->> 'reason') like 'support request%',
+    'the grant path records who authorised it and why');
+
+  -- The authorisation is spent: the very next statement is refused again.
+  begin
+    update public.profiles set client_id = 'ffffffff-ffff-4fff-8fff-fffffffffff1'
+     where id = '88888888-8888-4888-8888-888888888882';
+  exception when others then v_blocked := true;
+  end;
+  perform public.test_assert(v_blocked, 'one authorisation covers exactly one statement');
+end $$;
+
+-- 11b(iv). An authorisation names one profile; it does not open the table.
+reset role;
+select set_config('request.jwt.claim.sub', '', true);
+do $$
+declare v_blocked boolean := false; v_client uuid;
+begin
+  perform public.rpc_authorise_identity_change(
+    '88888888-8888-4888-8888-888888888881', 'support request: for the other user only');
+
+  begin
+    -- A different profile, using the grant written above. (The value has to
+    -- differ from the current one, otherwise there is no identity change to
+    -- authorise and the guard correctly allows it.)
+    update public.profiles set client_id = 'ffffffff-ffff-4fff-8fff-fffffffffff1'
+     where id = '88888888-8888-4888-8888-888888888882';
+  exception when others then v_blocked := true;
+  end;
+
+  select client_id into v_client
+    from public.profiles where id = '88888888-8888-4888-8888-888888888882';
+  perform public.test_assert(v_blocked,
+    'an authorisation for one profile does not authorise another');
+  perform public.test_assert(v_client = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+    'the other profile is untouched by the refused change');
+
+  -- Clean up the unused authorisation so later blocks start from zero.
+  delete from public.identity_change_grants;
+end $$;
+
+-- 11b(v). The authorisation helper is a SQL-editor capability, not an endpoint.
+do $$
+declare v_role text;
+begin
+  foreach v_role in array array['anon', 'authenticated', 'service_role'] loop
+    perform public.test_assert(
+      not has_function_privilege(v_role,
+        'public.rpc_authorise_identity_change(uuid, text)', 'execute'),
+      format('%s cannot authorise an identity change over the API', v_role));
+  end loop;
+end $$;
+
+-- 11c. Moving an invoice line cannot leave the old invoice's totals stale -----
+reset role;
+select set_config('request.jwt.claim.sub', '', true);
+
+insert into public.invoices (id, invoice_number, client_id, issue_date, due_date, subtotal_minor, total_minor, status)
+values ('ffffffff-1111-4111-8111-fffffffffff1', 'MOVE-INV-1',
+        'ffffffff-ffff-4fff-8fff-fffffffffff1', current_date, current_date + 30, 0, 0, 'pending'),
+       ('ffffffff-2222-4222-8222-fffffffffff2', 'MOVE-INV-2',
+        'ffffffff-ffff-4fff-8fff-fffffffffff1', current_date, current_date + 30, 0, 0, 'pending')
+on conflict (id) do nothing;
+
+do $$
+declare
+  v_a uuid := 'ffffffff-1111-4111-8111-fffffffffff1';
+  v_b uuid := 'ffffffff-2222-4222-8222-fffffffffff2';
+  v_line uuid;
+  v_blocked boolean := false;
+  v_sum_a bigint; v_total_a bigint;
+  v_sum_b bigint; v_total_b bigint;
+begin
+  insert into public.invoice_items (invoice_id, description, quantity, unit_price_minor, amount_minor)
+  values (v_a, 'Design retainer', 1, 30000, 30000)
+  returning id into v_line;
+
+  select subtotal_minor, total_minor into v_sum_a, v_total_a
+    from public.invoices where id = v_a;
+
+  -- Move that line to the other invoice.
+  begin
+    update public.invoice_items set invoice_id = v_b where id = v_line;
+  exception when others then v_blocked := true;
+  end;
+
+  select subtotal_minor, total_minor into v_sum_b, v_total_b
+    from public.invoices where id = v_b;
+
+  perform public.test_assert(v_blocked,
+    'an invoice line cannot be moved to a different invoice');
+  perform public.test_assert(v_sum_a = 30000 and v_total_a = 30000,
+    'the source invoice keeps its own totals after the refused move');
+  perform public.test_assert(v_sum_b = 0 and v_total_b = 0,
+    'the destination invoice is not credited with a line it never had');
+  perform public.test_assert(
+    (select invoice_id from public.invoice_items where id = v_line) = v_a,
+    'the line is still on its original invoice');
+
+  -- Ordinary edits on one invoice still roll up, and only to that invoice.
+  update public.invoice_items set amount_minor = 45000 where id = v_line;
+  select subtotal_minor, total_minor into v_sum_a, v_total_a
+    from public.invoices where id = v_a;
+  select subtotal_minor, total_minor into v_sum_b, v_total_b
+    from public.invoices where id = v_b;
+  perform public.test_assert(v_sum_a = 45000 and v_total_a = 45000,
+    'editing a line updates its own invoice total');
+  perform public.test_assert(v_sum_b = 0 and v_total_b = 0,
+    'editing a line does not touch another invoice');
+
+  -- Deleting the last line returns the invoice to zero, not to a stale value.
+  delete from public.invoice_items where id = v_line;
+  select subtotal_minor, total_minor into v_sum_a, v_total_a
+    from public.invoices where id = v_a;
+  perform public.test_assert(v_sum_a = 0 and v_total_a = 0,
+    'deleting a line returns its invoice to zero');
+end $$;
+
+-- 11d. Daily and weekly recurrence keep the local wall clock across DST ------
+do $$
+declare
+  v_ny_daily  timestamptz;
+  v_ny_night  timestamptz;
+  v_ny_weekly timestamptz;
+  v_kol_daily timestamptz;
+begin
+  -- 09:00 in New York on 6 Mar 2026 (EST). US DST starts on 8 Mar 2026.
+  v_ny_daily := public.next_occurrence_tz('2026-03-06 14:00+00', 'daily', 'America/New_York');
+  perform public.test_assert(
+    v_ny_daily = '2026-03-07 14:00+00'::timestamptz,
+    'a daily step before the spring change keeps 09:00 local');
+
+  v_ny_daily := public.next_occurrence_tz('2026-03-07 14:00+00', 'daily', 'America/New_York');
+  perform public.test_assert(
+    v_ny_daily = '2026-03-08 13:00+00'::timestamptz,
+    'a daily step across the spring change keeps 09:00 local, not 10:00');
+  perform public.test_assert(
+    (v_ny_daily at time zone 'America/New_York')::time = '09:00'::time,
+    'the wall clock is preserved across the spring change');
+
+  -- 09:00 in New York on 25 Oct 2026 (EDT). US DST ends on 1 Nov 2026.
+  v_ny_weekly := public.next_occurrence_tz('2026-10-25 13:00+00', 'weekly', 'America/New_York');
+  perform public.test_assert(
+    v_ny_weekly = '2026-11-01 14:00+00'::timestamptz,
+    'a weekly step across the autumn change keeps 09:00 local, not 08:00');
+  perform public.test_assert(
+    (v_ny_weekly at time zone 'America/New_York')::time = '09:00'::time,
+    'the weekly wall clock is preserved across the autumn change');
+
+  -- A wall time that does not exist (02:30 on the spring-forward day) must
+  -- still land on a real instant, one step later, not on a NaN-like value.
+  v_ny_night := public.next_occurrence_tz('2026-03-07 07:30+00', 'daily', 'America/New_York');
+  perform public.test_assert(
+    v_ny_night is not null and v_ny_night > '2026-03-07 07:30+00'::timestamptz,
+    'a step onto a skipped wall time still resolves forward');
+
+  -- A zone without DST is unchanged, and an unknown zone falls back safely.
+  v_kol_daily := public.next_occurrence_tz('2026-03-07 03:30+00', 'daily', 'Asia/Kolkata');
+  perform public.test_assert(
+    v_kol_daily = '2026-03-08 03:30+00'::timestamptz,
+    'a daily step in a zone without DST is exactly 24 hours');
+  perform public.test_assert(
+    public.next_occurrence_tz('2026-03-07 03:30+00', 'daily', 'Not/AZone')
+      = '2026-03-08 03:30+00'::timestamptz,
+    'an unknown time zone falls back to Asia/Kolkata instead of failing');
 end $$;
 
 

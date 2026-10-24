@@ -128,7 +128,7 @@ fi
 # A floor on the number of assertions. Deleting whole blocks of tests leaves a
 # suite that still says "ALL TESTS PASSED", so the count is part of the gate.
 # Raise MIN_ASSERTIONS when tests are added; the suite only ever grows.
-MIN_ASSERTIONS="${MIN_ASSERTIONS:-190}"
+MIN_ASSERTIONS="${MIN_ASSERTIONS:-230}"
 assertions="$(grep -c 'ok —' "$LOG" || true)"
 if [[ "$assertions" -lt "$MIN_ASSERTIONS" ]]; then
   printf '\n✗ only %s assertions ran (expected at least %s) — tests went missing\n' \

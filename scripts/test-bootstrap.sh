@@ -47,8 +47,15 @@ trap cleanup EXIT
 
 psql_x() { psql -X -q -t -A -v ON_ERROR_STOP=1 -d "$DATABASE" "$@"; }
 
-if ! psql_x -c 'select 1' >/dev/null 2>&1; then
-  echo "→ $DATABASE does not exist; creating it with scripts/verify-migrations.sh"
+# Rebuild the scratch database every run (SKIP_MIGRATE=1 opts out).
+#
+# Checking only that the database *exists* was a trap: an older scratch
+# database from a previous round is missing the newest functions, and the
+# failure surfaces as "function does not exist" in the middle of a test that
+# looks unrelated. Applying the migrations first makes the result depend on the
+# repository, not on what happens to be lying around in the cluster.
+if [[ "${SKIP_MIGRATE:-0}" != "1" ]]; then
+  echo "→ applying migrations to $DATABASE"
   DATABASE="$DATABASE" bash scripts/verify-migrations.sh >/dev/null 2>&1 || {
     echo "✗ could not prepare $DATABASE" >&2
     exit 1

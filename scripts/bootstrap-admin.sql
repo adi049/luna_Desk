@@ -76,9 +76,17 @@ begin
   --    is_admin() honours. Writing both means deactivation has to clear both,
   --    which rpc_set_admin_active() does.
   ---------------------------------------------------------------------------
-  insert into public.profiles (id, full_name, email, role, is_active)
-  values (v_user_id, 'Workspace admin', v_admin_email, 'admin', true)
-  on conflict (id) do update set role = 'admin', is_active = true, email = excluded.email;
+  -- The profile row is created without a role, then promoted through the same
+  -- authorisation every identity change needs (migration 0014). Doing it in one
+  -- `on conflict do update` would be refused by the guard, by design: no writer
+  -- changes a role without authorisation, not even the owner.
+  insert into public.profiles (id, full_name, email, is_active)
+  values (v_user_id, 'Workspace admin', v_admin_email, true)
+  on conflict (id) do update set email = excluded.email, is_active = true;
+
+  perform public.rpc_authorise_identity_change(
+    v_user_id, 'bootstrap-admin.sql: first-run promotion');
+  update public.profiles set role = 'admin' where id = v_user_id;
 
   insert into public.user_roles (user_id, role)
   values (v_user_id, 'admin')

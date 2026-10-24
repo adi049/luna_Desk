@@ -37,10 +37,12 @@ supabase db push          # applies supabase/migrations in order
 ```
 
 …or paste the files from `supabase/migrations/` into the SQL editor **in order**,
-`0001` through `0013`. The last one,
-`0013_identity_and_financial_integrity.sql`, is the one that makes a client's
-role and portal link immutable from the API — apply it or an administrator can
-repoint a customer with a plain `UPDATE`.
+`0001` through `0014`. `0013` makes a client's role and portal link immutable
+from the API; `0014` is what makes that usable — it lets the sanctioned portal
+RPC through the guard, closes the "no JWT" exemption, binds each authorisation
+to one profile, refuses invoice-line moves between invoices, and steps daily and
+weekly recurrences on the wall clock so a 09:00 reminder stays at 09:00 across
+a DST change.
 
 Verify locally before you push (recommended):
 
@@ -54,8 +56,8 @@ The same command is `npm run verify:db`. It needs a local PostgreSQL 15+ and
 database named `lunadesk_verify`.
 
 The script recreates a scratch database, applies every migration and runs
-`supabase/tests/rls.sql` (202 assertions on isolation, money, access, identity
-immutability and receipts).
+`supabase/tests/rls.sql` (237 assertions on isolation, money, access, identity
+immutability, receipts, line-item integrity and DST-safe recurrence).
 
 ### Changing a customer's portal link
 
@@ -63,7 +65,8 @@ Identity changes are deliberately not an API endpoint. From the **SQL editor**
 (owner credentials) only:
 
 ```sql
--- 1. The customer was created under the wrong client and never signed in.
+-- Preferred: the sanctioned, audited call (owner-only, needs an 8+ character
+-- reason, refuses to remove the last active administrator).
 select public.rpc_set_profile_identity(
   '<auth-user-uuid>',
   'client',
@@ -71,6 +74,21 @@ select public.rpc_set_profile_identity(
   're-created under the correct account, user never signed in'
 );
 ```
+
+If you are repairing rows by hand instead, authorise the statement first — the
+guard refuses every writer without one, including the SQL editor:
+
+```sql
+select public.rpc_authorise_identity_change(
+  '<auth-user-uuid>', 'repair: wrong client after re-import');
+
+update public.profiles
+   set role = 'client', client_id = '<client-uuid>'
+ where id = '<auth-user-uuid>';
+```
+
+One authorisation covers one profile and one statement, and expires in two
+minutes.
 
 The call is audited (`profile.identity.change`), refuses to remove the last
 active administrator, and refuses to link a profile that is not a `client`.
@@ -218,11 +236,13 @@ block at the top of the file.
 | `npm run check:rpc` | every bridged browser call maps to a real, granted SQL function | — |
 | `npm run check:secrets` | no credential-shaped strings in tracked files | — |
 | `npm run check:secrets:history` | same, across all committed blobs | a git checkout |
-| `npm run verify:db` | all migrations apply; 202 RLS/RPC assertions pass (the runner refuses to report success below `MIN_ASSERTIONS`) | PostgreSQL 17 |
+| `npm run verify:db` | all migrations apply; 237 RLS/RPC assertions pass (the runner refuses to report success below `MIN_ASSERTIONS`) | PostgreSQL 17 |
 | `npm run test:bootstrap` | the bootstrap script refuses placeholders and never leaks the code | PostgreSQL 17 |
 | `npm run test:concurrency` | two simultaneous admin deactivations cannot empty the workspace | PostgreSQL 17 |
 | `npm run test:verifier` | the migration verifier really fails on a broken migration | PostgreSQL 17 |
 | `npm run test:e2e` | 11 Chromium tests: every route, guards, deep links, back/forward, one payment, one client creation, three viewports | Chromium (`npx playwright install --with-deps chromium`) |
+| `npm run check:edge` | every Edge Function query binds and checks its `error` |
+| `npm run test:edge` | the Edge query checker's own 8 cases pass |
 | `npm run check:env` | the build environment is deployable (https URL, anon/publishable key, never `service_role`, valid `BASE_PATH`) | — |
 | `npm run test:env` | the environment validator's own 14 cases pass | — |
 

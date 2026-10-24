@@ -1,9 +1,8 @@
 # Pre-Supabase audit — LunaDesk
 
-Date: 2026-10-23, extended 2026-10-24 (three times)
-Scope: the repository as committed at `ae7c200`, hardened locally in four
-rounds. §9 is the second round, §10 the third, §11 the fourth and final
-pre-Supabase pass.
+Date: 2026-10-23, extended 2026-10-24 (four times)
+Scope: the repository as committed at `ae7c200`, hardened locally in five
+rounds. §9 is the second round, §10 the third, §11 the fourth, §12 the fifth.
 **No live Supabase project was contacted, created or modified.** Every database
 result below comes from a local PostgreSQL 17 instance running the migrations in
 `supabase/migrations/`.
@@ -990,3 +989,197 @@ above comes from PostgreSQL 17 and Chromium on one machine: no Edge Function has
 run on Supabase's runtime, no request has been authenticated against a real
 project, and no browser has received a real push message. The honest status is
 **ready for staging**, with §11.7 as the gate.
+
+---
+
+# 12. Fifth round — the fixes that round four broke, and two defects it missed
+
+Round four's own changes were attacked the same way as everything else. Three
+of the four findings below were *caused* by round four, which is the honest
+summary of a hardening round: it moved the boundary and left two holes in the
+new one.
+
+Every defect was first reproduced with `scripts/probe-round5.sql`, then fixed,
+then re-probed. The permanent regression tests are
+`supabase/tests/rls.sql` §11 (35 assertions).
+
+## 12.1 Portal provisioning was dead (round 4 self-inflicted)
+
+`rpc_attach_client_portal` sets `profiles.role` and `profiles.client_id`.
+Migration 0013's guard refuses exactly that from an API session unless an
+`identity_change_grants` row exists. So the moment 0013 shipped, an
+administrator could no longer provision a portal — the same class of defect as
+the service-key bug that 0013 was written to fix.
+
+```
+BEFORE: PROBE 1 attach_client_portal as admin -> 42501 Role and client-link
+        changes must go through rpc_set_profile_identity(); …
+AFTER:  PROBE 1 attach_client_portal as admin -> SUCCESS
+```
+
+**Fix.** A sanctioned RPC marks *its own* identity write as authorised: after
+`assert_admin()` it sets the transaction-local GUC
+`lunadesk.identity_change` with `is_local := true`, and the guard accepts the
+change, audits it with `authorised_by: 'rpc'` and the reason, and clears the
+marker. A browser cannot set an arbitrary GUC — PostgREST exposes functions, not
+`set_config` — and no granted function takes the marker's value from an
+argument.
+
+Provisioning also refuses two dangerous things it used to do silently:
+
+* turning an **administrator** into a portal identity (`42501`);
+* **moving** a user who already belongs to another client (`42501`) — that is a
+  cross-tenant reassignment and needs `rpc_set_profile_identity` with a written
+  reason.
+
+## 12.2 "No JWT" meant "trusted"
+
+The 0013 guard wrapped its whole check in `if auth.uid() is not null then …`.
+A service-role request, a cron job or any definer with no subject skipped
+authorisation entirely:
+
+```
+BEFORE: PROBE 2 no-JWT identity change -> SUCCESS (client_id now 99999999-…-99d)
+AFTER:  PROBE 2 no-JWT identity change -> 42501 Changing a profile role or
+        client link requires an authorisation …
+```
+
+**Fix.** Every writer is checked. An identity change needs one of:
+
+| Signal | Written by | Scope |
+| --- | --- | --- |
+| `lunadesk.identity_change` marker | a sanctioned RPC that already ran `assert_admin()` or is owner-only | this transaction, consumed |
+| `identity_change_grants` row | `rpc_authorise_identity_change(profile_id, reason)` — owner-only, revoked from `anon`, `authenticated` and `service_role` | **one profile**, one statement, 2-minute TTL |
+| nothing else | — | refused with `42501` |
+
+Two refinements matter:
+
+* a grant is **bound to a profile** (`profile_id`), so a lingering authorisation
+  cannot be spent on a different customer, and batched fixtures authorise each
+  row separately (asserted in §11b(iv));
+* a grant used from a session **that has a JWT subject must still be an
+  administrator**, so an open grant can never let a signed-in customer escalate.
+
+The owner has no implicit bypass either — the SQL-editor flow is
+`select rpc_authorise_identity_change('<profile>', '<reason>');` followed by the
+statement. `scripts/bootstrap-admin.sql` and every test fixture were updated to
+that flow; `rpc_promote_admin` now delegates to `rpc_set_profile_identity`
+instead of mutating roles behind the guard's back.
+
+**Bonus defect found while rewriting it:** 0009's `rpc_promote_admin` wrote its
+audit row into columns that do not exist (`actor_role`, `target_table`,
+`target_id`, `details`), so the function raised at runtime the first time it was
+called. Replaced.
+
+## 12.3 A line item moved between invoices left a stale total
+
+`guard_invoice_items` computed the parent as `coalesce(new.invoice_id,
+old.invoice_id)`, so on a move only the destination was recomputed. The source
+invoice kept a total for items it no longer had — and a receipt printed that
+total.
+
+```
+BEFORE: PROBE 3 move line -> SUCCESS | invoice A subtotal=30000 total=30000
+        | invoice B subtotal=30000 total=30000      ← the same 30000 counted twice
+AFTER:  PROBE 3 move line -> 0A000 Invoice line items cannot be moved between
+        invoices (from …bbb to …ccc) | invoice A subtotal=30000 total=30000
+        | invoice B subtotal=0 total=0
+```
+
+**Fix.** A move is refused outright (a line belongs to the invoice it was
+created on; delete and re-add), and the trigger recomputes **both** parents when
+both are known, oldest-id first so two concurrent edits cannot deadlock. The
+recomputation moved into `public.recompute_invoice_totals(invoice_id, enforce)`
+so the trigger and any repair script share one definition. §11c asserts the
+refused move, the source total, the destination total, a normal edit, and a
+delete.
+
+## 12.4 Recurrence drifted by an hour across DST
+
+```sql
+when 'daily'  then p_from + interval '1 day'   -- evaluated on the session clock
+```
+
+`timestamptz + interval` is computed in the *session* time zone, not the
+reminder's, so a 09:00 New York reminder became 10:00 after the spring change
+and 08:00 after the autumn one.
+
+```
+BEFORE: PROBE 4 daily step over DST -> 2026-03-08 14:00:00+00 UTC, local 10:00:00
+AFTER:  PROBE 4 daily step over DST -> 2026-03-08 13:00:00+00 UTC, local 09:00:00
+```
+
+**Fix.** Daily and weekly step the *wall clock* in the reminder's zone
+(`(p_from at time zone tz) + interval` then back), like monthly and yearly
+already did. A skipped wall time (02:30 on a spring-forward day) resolves
+forward to a real instant, an unknown zone falls back to `Asia/Kolkata`, and §11d
+asserts all of it, including a weekly step across the autumn change.
+
+## 12.5 Push-subscription read errors were dropped
+
+```ts
+const { data: subs } = await supabase.from('push_subscriptions')…   // no error
+for (const sub of subs ?? []) { … }
+```
+
+If that read failed (RLS, dropped connection, outage) `subs` was `null`, no push
+was attempted, `pushError` stayed `null`, and `rpc_complete_reminder_delivery`
+was told the delivery succeeded — so the occurrence was marked delivered and
+**advanced**, losing the notification with no trace.
+
+**Fix.** The error is checked; a read failure becomes `pushError` and is passed
+to the completion RPC, which schedules a retry. The stale-subscription delete
+(404/410) also checks its error and logs it. `requireAdmin`'s profile lookup had
+the same shape (a failed read reported as "not an administrator") and now fails
+closed *with a log line*.
+
+**Test.** The functions run on Deno against a live project, so
+`scripts/check-edge-queries.mjs` enforces the rule statically: every
+`const { … } = await ….from(…)` must bind `error` and consult it. It has an
+8-case self-test, and it was verified to catch the shipped defect by running it
+against the previous commit's file:
+
+```
+$ node scripts/check-edge-queries.mjs   # against HEAD~1 send-reminders/index.ts
+old send-reminders/index.ts:263: query result drops `error` — a failed read
+looks like an empty result
+```
+
+## 12.6 Checks actually run in this round
+
+| Command | Result |
+| --- | --- |
+| `npm run verify:db` (PostgreSQL 17, local) | pass — **14 migrations, 237 assertions**, 3 consecutive identical runs |
+| `npm run test:verifier` | pass — 14/14 |
+| `npm run test:bootstrap` | pass — 10/10 |
+| `npm run test:concurrency` | pass — 10/10 |
+| `npm run typecheck` | pass |
+| `npm run check:rpc` | pass — 42 SQL functions, 7 bridged calls |
+| `npm run check:edge` / `test:edge` | pass — clean tree · 8/8 self-test |
+| `npm run test:env` | pass — 14/14 |
+| `npm run check:secrets` | pass |
+| `npm run build:demo` | pass |
+| `npx playwright test e2e/smoke.spec.ts` | pass — 11/11 |
+| `scripts/probe-round5.sql` before/after | 4 defects reproduced on 0001–0013, none on 0001–0014 (output quoted above) |
+
+Test-script hygiene fixed this round: `test-bootstrap.sh` and
+`test-admin-concurrency.sh` used to reuse any existing scratch database, so a
+leftover from an earlier round produced "function does not exist" failures that
+looked like code bugs. They now re-apply the migrations every run
+(`SKIP_MIGRATE=1` opts out).
+
+## 12.7 Remaining risks
+
+| Risk | Why it remains |
+| --- | --- |
+| Edge Functions still never executed on Supabase's runtime | Deno + a real project are forbidden here; the static checker covers the query-error class, not behaviour |
+| The `lunadesk.identity_change` GUC is a trust boundary | It is safe because only owner-invoked definers set it, but it is invisible in a code review of the callers — `docs/SECURITY.md` says so explicitly |
+| An owner-written grant is spent by the next matching statement | Whoever holds owner credentials is already trusted; the grant narrows an accident, not a hostile owner |
+| PostgREST/RLS behaviour is inferred, not observed | No project; staging must re-run §11 |
+| No real push delivery, cron scheduling or DST *observed* on a device | SQL recurrence is now tested across both US transitions; the delivery path is not |
+
+## 12.8 Production readiness
+
+**Still not claimed**, for the same reason as §11.8: nothing here has ever
+authenticated against a real project. What changed is that the four defects
+above were real, are fixed, and now have tests that fail without the fix.

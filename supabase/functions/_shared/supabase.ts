@@ -90,11 +90,19 @@ export async function requireAdmin(req: Request): Promise<Caller | null> {
   const { data, error } = await supabase.auth.getUser(token);
   if (error || !data.user) return null;
 
-  const { data: profile } = await supabase
+  const { data: profile, error: profileError } = await supabase
     .from('profiles')
     .select('id, role, is_active')
     .eq('id', data.user.id)
     .maybeSingle();
+
+  // Fail closed, but say why. A failed lookup is not the same as "this user is
+  // not an administrator": swallowing it turns an outage into a 403 that looks
+  // like a permissions problem and leaves nothing in the logs.
+  if (profileError) {
+    console.error('admin profile lookup failed', profileError.message);
+    return null;
+  }
 
   const isAdmin = profile?.role === 'admin' && profile.is_active !== false;
   if (!isAdmin) return null;

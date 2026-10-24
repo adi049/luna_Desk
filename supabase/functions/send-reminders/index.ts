@@ -260,12 +260,22 @@ Deno.serve(async (req) => {
     let pushError: string | null = null;
 
     if (pushEnabled && reminder.browser_notifications) {
-      const { data: subs } = await supabase
+      // The error is checked, not dropped. An unchecked failure here (RLS, a
+      // dropped connection, a missing table) returns `data: null`, the loop
+      // below would attempt no push at all, `pushError` would stay null, and the
+      // reminder would be marked delivered and advanced — a notification lost
+      // with no trace. A read failure is a delivery failure: it is retried.
+      const { data: subs, error: subsError } = await supabase
         .from('push_subscriptions')
         .select('id, endpoint, p256dh, auth')
         .eq('user_id', reminder.owner_id);
 
-      for (const sub of subs ?? []) {
+      if (subsError) {
+        pushError = `push subscriptions: ${subsError.message}`;
+        console.error('push subscription lookup failed', subsError.message);
+      }
+
+      for (const sub of subsError ? [] : subs ?? []) {
         try {
           await webpush.sendNotification(
             { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
@@ -285,7 +295,15 @@ Deno.serve(async (req) => {
           const status = (err as { statusCode?: number }).statusCode;
           if (status === 404 || status === 410) {
             // The endpoint is gone (uninstalled, permission reset, expired).
-            await supabase.from('push_subscriptions').delete().eq('id', sub.id);
+            // A failed cleanup is logged rather than retried: the send already
+            // failed, and the next run will try the row again.
+            const { error: deleteError } = await supabase
+              .from('push_subscriptions')
+              .delete()
+              .eq('id', sub.id);
+            if (deleteError) {
+              console.error('stale subscription cleanup failed', deleteError.message);
+            }
           } else {
             pushError = `push ${status ?? 'error'}: ${(err as Error).message}`;
             console.error('push failed', status, (err as Error).message);

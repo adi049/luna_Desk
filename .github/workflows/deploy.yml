@@ -53,6 +53,9 @@ jobs:
       - name: Secret scan of the tree
         run: node scripts/scan-secrets.mjs
 
+      - name: Edge Functions check their query errors
+        run: npm run check:edge
+
       # Project pages are served from /<repo>/, user pages and custom domains
       # from /. Override by setting BASE_PATH in this file.
       - name: Build
