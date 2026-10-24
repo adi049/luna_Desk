@@ -196,6 +196,41 @@ test.describe('admin', () => {
     await expect.poll(async () => rows.count(), { timeout: 15_000 }).toBe(before + 1);
     expect(errors).toEqual([]);
   });
+
+  // The live admin path posts through an Edge Function that then calls the
+  // client-portal RPCs as the *caller*. That was broken for a whole release
+  // because the service key carries no auth.uid(); this test keeps the UI half
+  // of that flow honest (the SQL half is covered by supabase/tests/rls.sql).
+  test('adding a client closes the drawer and shows the new client', async ({ page }) => {
+    const errors = watchErrors(page);
+    await signInAsAdmin(page);
+    await page.goto('/#/admin/clients');
+
+    const rows = page.locator('tbody tr');
+    const before = await stableCount(rows);
+
+    await page.getByRole('button', { name: 'Add client' }).first().click();
+    const dialog = page.getByRole('dialog');
+    await expect(dialog).toBeVisible();
+
+    const stamp = Date.now().toString().slice(-6);
+    await dialog.getByLabel(/client name/i).fill(`E2E Client ${stamp}`);
+    await dialog.getByLabel(/business name/i).fill(`E2E Business ${stamp}`);
+
+    // The code is generated on request; a blank one would be rejected.
+    const code = dialog.getByLabel(/client code/i);
+    if ((await code.inputValue()) === '') {
+      await dialog.getByRole('button', { name: /suggest a code/i }).click();
+    }
+    await expect(code).not.toHaveValue('');
+
+    await dialog.getByRole('button', { name: /^add client$/i }).click();
+
+    await expect(dialog).toBeHidden({ timeout: 15_000 });
+    await expect(page.getByText(`E2E Client ${stamp}`)).toBeVisible({ timeout: 15_000 });
+    await expect.poll(async () => rows.count(), { timeout: 15_000 }).toBe(before + 1);
+    expect(errors).toEqual([]);
+  });
 });
 
 test.describe('client portal', () => {

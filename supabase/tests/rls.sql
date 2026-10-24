@@ -1470,6 +1470,411 @@ begin
 end $$;
 
 
+-- ===========================================================================
+-- 9. Identity immutability (migration 0013)
+-- ===========================================================================
+reset role;
+select set_config('request.jwt.claim.sub', '', true);
+
+insert into auth.users (id, email) values
+  ('77777777-7777-4777-8777-777777777771', 'id-client@example.test'),
+  ('77777777-7777-4777-8777-777777777772', 'id-admin2@example.test')
+on conflict do nothing;
+
+-- auth.users has a handle_new_user trigger, so the profile may already exist
+-- with a null client link; upsert to make the fixture deterministic.
+insert into public.profiles (id, full_name, email, role, is_active, client_id) values
+  ('77777777-7777-4777-8777-777777777771', 'Linked client', 'id-client@example.test', 'client', true,
+   'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
+on conflict (id) do update
+  set full_name = excluded.full_name,
+      role      = excluded.role,
+      client_id = excluded.client_id,
+      is_active = true;
+
+insert into public.profiles (id, full_name, email, role, is_active) values
+  ('77777777-7777-4777-8777-777777777772', 'Second admin', 'id-admin2@example.test', 'admin', true)
+on conflict (id) do update set role = 'admin', is_active = true;
+insert into public.user_roles (user_id, role) values ('77777777-7777-4777-8777-777777777772', 'admin')
+on conflict do nothing;
+
+insert into public.clients (id, name, business_name, client_code, status) values
+  ('dddddddd-dddd-4ddd-8ddd-dddddddddddd', 'Other Co', 'Other Co', 'OTH001', 'active')
+on conflict (id) do nothing;
+
+-- 9a. A client cannot repoint their own client_id, even with a valid session.
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '77777777-7777-4777-8777-777777777771', true);
+do $$
+declare v_blocked boolean := false;
+begin
+  begin
+    update public.profiles set client_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+     where id = '77777777-7777-4777-8777-777777777771';
+  exception when others then v_blocked := true;
+  end;
+  perform public.test_assert(v_blocked,
+    'a client cannot repoint their own client_id (cross-client data access)');
+end $$;
+
+-- 9b. A client cannot promote themselves.
+do $$
+declare v_blocked boolean := false; v_role text;
+begin
+  begin
+    update public.profiles set role = 'admin' where id = '77777777-7777-4777-8777-777777777771';
+  exception when others then v_blocked := true;
+  end;
+  reset role;
+  select role into v_role from public.profiles where id = '77777777-7777-4777-8777-777777777771';
+  perform public.test_assert(v_blocked, 'a client cannot set their own role to admin');
+  perform public.test_assert(v_role = 'client', 'the refused self-promotion changed nothing');
+end $$;
+
+-- 9c. An ADMIN cannot accidentally reassign a client either: identity changes
+--     are refused without the owner-only grant, which no API session can write.
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '11111111-1111-4111-8111-111111111111', true);
+do $$
+declare v_blocked boolean := false; v_client uuid;
+begin
+  begin
+    update public.profiles set client_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+     where id = '77777777-7777-4777-8777-777777777771';
+  exception when others then v_blocked := true;
+  end;
+  reset role;
+  select client_id into v_client from public.profiles where id = '77777777-7777-4777-8777-777777777771';
+  perform public.test_assert(v_blocked,
+    'an administrator cannot repoint a client link by a plain UPDATE');
+  perform public.test_assert(v_client = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    'the client link is unchanged after the refused reassignment');
+end $$;
+
+-- 9d. An admin cannot forge an admin role on a client-linked profile.
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '11111111-1111-4111-8111-111111111111', true);
+do $$
+declare v_blocked boolean := false; v_role text; v_grant int;
+begin
+  begin
+    update public.profiles set role = 'admin' where id = '77777777-7777-4777-8777-777777777771';
+  exception when others then v_blocked := true;
+  end;
+  reset role;
+  select role into v_role from public.profiles where id = '77777777-7777-4777-8777-777777777771';
+  select count(*) into v_grant from public.user_roles where user_id = '77777777-7777-4777-8777-777777777771';
+  perform public.test_assert(v_blocked,
+    'a client-linked profile cannot be turned into an administrator');
+  perform public.test_assert(v_role = 'client', 'the profile is still a client');
+  perform public.test_assert(v_grant = 0, 'no admin grant was created');
+end $$;
+
+-- 9e. The invariant holds even for a trusted writer: client_id requires role.
+reset role;
+select set_config('request.jwt.claim.sub', '', true);
+do $$
+declare v_blocked boolean := false;
+begin
+  begin
+    update public.profiles set role = 'admin'
+     where id = '77777777-7777-4777-8777-777777777771';
+  exception when others then v_blocked := true;
+  end;
+  perform public.test_assert(v_blocked,
+    'even a service-role statement cannot leave an admin linked to a client portal');
+end $$;
+
+-- 9f. The sanctioned path works, is audited, and is not callable from the API.
+do $$
+declare
+  v_res   jsonb;
+  v_role  text;
+  v_audit int;
+begin
+  select count(*) into v_audit from public.audit_logs where action = 'profile.identity.change';
+
+  v_res := public.rpc_set_profile_identity(
+    '77777777-7777-4777-8777-777777777771', 'client',
+    'dddddddd-dddd-4ddd-8ddd-dddddddddddd', 'client moved to a different account');
+
+  select role into v_role from public.profiles where id = '77777777-7777-4777-8777-777777777771';
+
+  perform public.test_assert((v_res ->> 'ok')::boolean and (v_res ->> 'changed')::boolean,
+    'the sanctioned identity RPC reassigns the client link');
+  perform public.test_assert(v_role = 'client', 'the role is preserved as client');
+  perform public.test_assert(
+    (select count(*) from public.audit_logs where action = 'profile.identity.change') = v_audit + 1,
+    'an identity change is audited');
+
+  perform public.test_assert(
+    not has_function_privilege('authenticated',
+      'public.rpc_set_profile_identity(uuid, app_role, uuid, text)', 'execute'),
+    'rpc_set_profile_identity is not callable from the API');
+  perform public.test_assert(
+    not has_function_privilege('service_role',
+      'public.rpc_set_profile_identity(uuid, app_role, uuid, text)', 'execute'),
+    'rpc_set_profile_identity is not callable with the service key either');
+  perform public.test_assert(
+    not has_function_privilege('authenticated', 'public.guard_profile_identity()', 'execute'),
+    'the identity guard trigger function is not callable directly');
+end $$;
+
+-- 9g. The sanctioned path refuses to empty the workspace of administrators.
+reset role;
+do $$
+declare v_blocked boolean := false;
+begin
+  -- Leave exactly one active admin other than the demotion target.
+  update public.profiles set is_active = false
+   where role = 'admin' and id <> '11111111-1111-4111-8111-111111111111';
+  begin
+    perform public.rpc_set_profile_identity(
+      '11111111-1111-4111-8111-111111111111', 'client', null, 'accidental demotion attempt');
+  exception when others then v_blocked := true;
+  end;
+  perform public.test_assert(v_blocked,
+    'the sanctioned path refuses to remove the last active administrator');
+  update public.profiles set is_active = true
+   where id = '77777777-7777-4777-8777-777777777772';
+end $$;
+
+-- ===========================================================================
+-- 10. Financial integrity end to end (migration 0013 + 0003/0007)
+-- ===========================================================================
+reset role;
+select set_config('request.jwt.claim.sub', '', true);
+
+insert into public.clients (id, name, business_name, client_code, status) values
+  ('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee', 'Money Co', 'Money Co', 'MON001', 'active')
+on conflict (id) do nothing;
+
+insert into public.invoices (id, invoice_number, client_id, subtotal_minor, total_minor, due_date, status)
+values ('eeeeeeee-1111-4111-8111-eeeeeeeeeeee', 'MONEY-INV-1',
+        'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee', 100000, 100000, current_date - 1, 'pending')
+on conflict (id) do nothing;
+
+-- 10a. Line items drive the subtotal, and freeze once money arrives.
+do $$
+declare v_sum bigint; v_total bigint; v_blocked boolean := false;
+begin
+  insert into public.invoice_items (invoice_id, description, quantity, unit_price_minor, amount_minor)
+  values ('eeeeeeee-1111-4111-8111-eeeeeeeeeeee', 'Retainer', 1, 60000, 60000),
+         ('eeeeeeee-1111-4111-8111-eeeeeeeeeeee', 'Ad spend', 1, 40000, 40000);
+
+  select subtotal_minor, total_minor into v_sum, v_total
+    from public.invoices where id = 'eeeeeeee-1111-4111-8111-eeeeeeeeeeee';
+
+  perform public.test_assert(v_sum = 100000,
+    'the invoice subtotal follows its line items');
+  perform public.test_assert(v_total = 100000,
+    'the invoice total follows its line items');
+
+  insert into public.payments (client_id, invoice_id, amount_minor, method)
+  values ('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee', 'eeeeeeee-1111-4111-8111-eeeeeeeeeeee', 25000, 'upi');
+
+  begin
+    update public.invoice_items set amount_minor = 1
+     where invoice_id = 'eeeeeeee-1111-4111-8111-eeeeeeeeeeee';
+  exception when others then v_blocked := true;
+  end;
+
+  perform public.test_assert(v_blocked,
+    'line items cannot be edited once a payment exists');
+  perform public.test_assert(
+    (select sum(amount_minor) from public.invoice_items
+      where invoice_id = 'eeeeeeee-1111-4111-8111-eeeeeeeeeeee') = 100000,
+    'the refused edit left the line items intact');
+end $$;
+
+-- 10b. Overpayment, zero and negative are refused; the balance is exact.
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '11111111-1111-4111-8111-111111111111', true);
+do $$
+declare
+  v_inv uuid := 'eeeeeeee-1111-4111-8111-eeeeeeeeeeee';
+  v_msg text; v_blocked int := 0; v_pay public.payments;
+begin
+  begin perform public.rpc_record_payment(v_inv, 75001, current_date, 'upi', 'OVP-1', null);
+  exception when others then v_blocked := v_blocked + 1; end;
+  begin perform public.rpc_record_payment(v_inv, 0, current_date, 'upi', 'ZERO-1', null);
+  exception when others then v_blocked := v_blocked + 1; end;
+  begin perform public.rpc_record_payment(v_inv, -100, current_date, 'upi', 'NEG-1', null);
+  exception when others then v_blocked := v_blocked + 1; end;
+
+  perform public.test_assert(v_blocked = 3,
+    format('overpayment, zero and negative amounts are all refused (%s of 3)', v_blocked));
+
+  -- The exact remaining balance is accepted and settles the invoice.
+  v_pay := public.rpc_record_payment(v_inv, 75000, current_date, 'upi', 'EXACT-1', null);
+  perform public.test_assert(
+    (select status from public.invoices where id = v_inv) = 'paid',
+    'paying the exact balance marks the invoice paid');
+  perform public.test_assert(v_pay.amount_minor = 75000, 'the recorded amount is exact');
+
+  -- Nothing further can be added to a settled invoice.
+  begin perform public.rpc_record_payment(v_inv, 1, current_date, 'upi', 'ONE-MORE', null);
+        raise exception 'unreachable';
+  exception when others then null; end;
+  perform public.test_assert(
+    (select coalesce(sum(amount_minor),0) from public.payments
+      where invoice_id = v_inv and voided_at is null) = 100000,
+    'a settled invoice cannot be paid past its total');
+end $$;
+
+-- 10c. Duplicate submissions are refused, and a void frees the reference.
+do $$
+declare
+  v_inv uuid := 'eeeeeeee-1111-4111-8111-eeeeeeeeeeee';
+  v_pay public.payments;
+  v_blocked boolean := false;
+  v_count int;
+begin
+  select * into v_pay from public.payments
+   where invoice_id = v_inv and reference = 'EXACT-1' and voided_at is null;
+
+  begin
+    perform public.rpc_record_payment(v_inv, 1, current_date, 'upi', 'EXACT-1', null);
+  exception when others then v_blocked := true;
+  end;
+  perform public.test_assert(v_blocked,
+    'a second payment with the same reference on the same invoice is refused');
+
+  select count(*) into v_count from public.payments
+   where invoice_id = v_inv and reference = 'EXACT-1';
+  perform public.test_assert(v_count = 1, 'the double-submit created no second row');
+
+  -- After a void, the reference may be reused: the correction is a new row.
+  perform public.rpc_void_payment(v_pay.id, 'entered against the wrong invoice');
+  perform public.rpc_record_payment(v_inv, 20000, current_date, 'upi', 'EXACT-1', null);
+
+  perform public.test_assert(
+    (select count(*) from public.payments
+      where invoice_id = v_inv and reference = 'EXACT-1' and voided_at is null) = 1,
+    'a voided payment frees its reference for a corrected entry');
+  -- This invoice is past its due date, and the documented precedence is
+  -- cancelled > paid > overdue > partially_paid > pending, so "overdue" is the
+  -- correct recomputed status; the balance is what proves the void reopened it.
+  perform public.test_assert(
+    (select status from public.invoices where id = v_inv) = 'overdue',
+    'voiding recomputes status and keeps the overdue ranking');
+  perform public.test_assert(
+    (select coalesce(sum(amount_minor), 0) from public.payments
+      where invoice_id = v_inv and voided_at is null) = 45000,
+    'voiding leaves only the non-voided balance on the invoice');
+end $$;
+
+-- 10d. Receipts are idempotent, immutable, and follow their payment.
+do $$
+declare
+  v_inv uuid := 'eeeeeeee-1111-4111-8111-eeeeeeeeeeee';
+  v_pay uuid;
+  v_r1 public.receipts;
+  v_r2 public.receipts;
+  v_blocked boolean;
+  v_snapshot_before jsonb;
+begin
+  -- Deterministic: the corrected 20000 entry, recorded after the 25000 one.
+  select id into v_pay from public.payments
+   where invoice_id = v_inv and voided_at is null and amount_minor = 20000;
+
+  v_r1 := public.rpc_issue_receipt(v_pay, 'first issue');
+  v_r2 := public.rpc_issue_receipt(v_pay, 'second issue');
+
+  perform public.test_assert(v_r1.id = v_r2.id,
+    'issuing a receipt twice returns the same document');
+  perform public.test_assert(
+    (select count(*) from public.receipts where payment_id = v_pay) = 1,
+    'a double-submitted receipt does not mint a second number');
+  perform public.test_assert(v_r1.receipt_number is not null,
+    'the receipt carries a number');
+
+  -- The snapshot is the authority for a reprint, and matches the payment.
+  v_snapshot_before := v_r1.snapshot;
+  perform public.test_assert(
+    (v_snapshot_before ->> 'amount_minor')::bigint = 20000,
+    'the receipt snapshot records the payment amount');
+  -- 100000 total, 25000 paid earlier, 20000 on this receipt.
+  perform public.test_assert(
+    (v_snapshot_before ->> 'previous_minor')::bigint = 25000
+      and (v_snapshot_before ->> 'balance_minor')::bigint = 55000,
+    'the receipt snapshot records the remaining balance');
+  perform public.test_assert(
+    (v_snapshot_before -> 'items') is not null
+      and jsonb_array_length(v_snapshot_before -> 'items') = 2,
+    'the receipt snapshot carries the invoice line items');
+
+  -- A voided payment voids its receipt rather than deleting it.
+  perform public.rpc_void_payment(v_pay, 'refunded in full');
+  perform public.test_assert(
+    (select voided_at is not null from public.receipts where payment_id = v_pay),
+    'voiding the payment voids the receipt but keeps the record');
+
+  -- The number is never reused or renumbered.
+  perform public.test_assert(
+    (select receipt_number from public.receipts where payment_id = v_pay) = v_r1.receipt_number,
+    'the receipt number is unchanged by the void');
+end $$;
+
+-- 10e. Archive workflows respect outstanding money.
+reset role;
+select set_config('request.jwt.claim.sub', '11111111-1111-4111-8111-111111111111', true);
+set local role authenticated;
+do $$
+declare v_blocked boolean := false;
+begin
+  begin
+    update public.clients set status = 'archived'
+     where id = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+  exception when others then v_blocked := true;
+  end;
+  perform public.test_assert(v_blocked,
+    'a client with an unpaid balance cannot be archived');
+end $$;
+
+-- Settle the remaining balance for real (archiving checks payments, not the
+-- status label).
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '11111111-1111-4111-8111-111111111111', true);
+do $$
+begin
+  perform public.rpc_record_payment(
+    'eeeeeeee-1111-4111-8111-eeeeeeeeeeee', 75000, current_date, 'upi', 'SETTLE-1',
+    'final settlement');
+  perform public.test_assert(
+    (select status from public.invoices where id = 'eeeeeeee-1111-4111-8111-eeeeeeeeeeee') = 'paid',
+    'the settlement payment closes the invoice');
+end $$;
+
+-- The portal code is issued by the system (extensions schema is owner-only).
+reset role;
+select set_config('request.jwt.claim.sub', '', true);
+insert into public.client_access_codes (client_id, code_hash)
+values ('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+        extensions.crypt('MONEY01', extensions.gen_salt('bf', 4)));
+
+-- Archiving revokes portal access and flips the portal status.
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '11111111-1111-4111-8111-111111111111', true);
+do $$
+declare v_code_revoked boolean; v_portal text;
+begin
+  update public.clients set status = 'archived'
+   where id = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+
+  reset role;
+  select coalesce(bool_and(is_revoked), true) into v_code_revoked
+    from public.client_access_codes where client_id = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+  select portal_status into v_portal
+    from public.clients where id = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+
+  perform public.test_assert(v_code_revoked,
+    'archiving a settled client revokes its portal codes');
+  perform public.test_assert(v_portal = 'revoked',
+    'archiving sets the portal status to revoked');
+end $$;
+
+
 rollback;
 
 drop function if exists public.test_assert(boolean, text);

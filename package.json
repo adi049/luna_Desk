@@ -14,13 +14,15 @@
     "check:rpc": "node scripts/check-rpc-contract.mjs",
     "check:secrets": "node scripts/scan-secrets.mjs",
     "check:secrets:history": "node scripts/scan-secrets.mjs --history",
-    "verify": "tsc --noEmit && node scripts/check-rpc-contract.mjs && node scripts/scan-secrets.mjs",
+    "verify": "tsc --noEmit && node scripts/check-rpc-contract.mjs && node scripts/scan-secrets.mjs && node scripts/check-env.mjs --self-test",
     "test:verifier": "scripts/test-verify-migrations.sh",
     "test:concurrency": "scripts/test-admin-concurrency.sh",
     "test:bootstrap": "scripts/test-bootstrap.sh",
     "test:db": "scripts/verify-migrations.sh && scripts/test-bootstrap.sh && scripts/test-admin-concurrency.sh",
     "build:demo": "VITE_DATA_MODE=demo SOURCEMAP=false vite build",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "check:env": "node scripts/check-env.mjs",
+    "test:env": "node scripts/check-env.mjs --self-test"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.1",

@@ -1,8 +1,9 @@
 # Pre-Supabase audit — LunaDesk
 
-Date: 2026-10-23, extended 2026-10-24 (twice)
-Scope: the repository as committed at `ae7c200`, hardened locally in three
-rounds. §9 is the second round, §10 the third.
+Date: 2026-10-23, extended 2026-10-24 (three times)
+Scope: the repository as committed at `ae7c200`, hardened locally in four
+rounds. §9 is the second round, §10 the third, §11 the fourth and final
+pre-Supabase pass.
 **No live Supabase project was contacted, created or modified.** Every database
 result below comes from a local PostgreSQL 17 instance running the migrations in
 `supabase/migrations/`.
@@ -801,3 +802,191 @@ are fixed and guarded, but the application has never authenticated against,
 written to, or been deployed with a real Supabase project, and the Edge
 Functions have never run on Supabase's runtime. Treat this as ready for a
 staging deployment against a real project, with §7 and §10.8 checked there.
+
+---
+
+# 11. Fourth round — final pre-Supabase pass
+
+Four defects were found by attacking the running system rather than reading it.
+Each one is reproducible with the probe described next to it, and each now has a
+regression test that fails if the fix is reverted.
+
+## 11.1 Every admin portal action was dead in live mode (service key ≠ caller)
+
+`admin-clients` authenticated the caller with `requireAdmin()`, which uses the
+**service-role** client, and then ran the portal RPCs through that same client.
+The RPCs call `assert_admin()`, which reads `auth.uid()`. A service-role request
+carries no JWT subject, so `auth.uid()` was `NULL` and every call raised:
+
+```
+NOTICE:  SERVICE-ROLE attach_client_portal -> 42501 Administrator role required
+```
+
+Probe: `set local role service_role` with no `request.jwt.claim.sub`, then
+`select public.rpc_attach_client_portal(...)`.
+
+The signatures were correct, which is why this survived three rounds of static
+checks: the bug was in *which client* issued the call, not in the call.
+**Impact:** creating a client, issuing or changing a portal code, revoking a
+portal and re-activating one all failed for a real administrator, while demo
+mode (which never touches SQL) looked perfect.
+
+**Fix:** `supabase/functions/_shared/supabase.ts` now exposes `userClient(token)`
+— anon key plus the caller's JWT — and `Caller` carries the token.
+`admin-clients` performs the three portal RPCs through it. The service client is
+now used for exactly what it is for: the Auth Admin API.
+
+**Rule extracted:** any RPC whose body calls `assert_admin()` or `is_client_of()`
+must run as the caller. This is recorded in `docs/SECURITY.md`.
+
+## 11.2 A customer could be reassigned, and nothing recorded it
+
+`profiles.client_id` **is** the client-isolation boundary: `current_client_id()`
+and every `is_client_of()` RLS policy read it. The existing guard only stopped
+non-admins, so an administrator — or a mis-click, or a bad script — could point
+one customer at another customer's data with no audit trail.
+
+Migration `0013_identity_and_financial_integrity.sql` closes this:
+
+* `guard_profile_identity` (replacing `profiles_guard`) refuses any change to
+  `role` or `client_id` from an API session unless an unfired
+  `identity_change_grants` row exists, and **always** writes an
+  `profile.identity.change` audit row — including for `service_role` and for
+  statements typed into the SQL editor.
+* `identity_change_grants` is owner-only: `revoke all` from `public`, `anon`,
+  `authenticated` and `service_role`, RLS enabled, no policies. Grants are
+  one-shot (deleted by the guard) and expire after two minutes.
+* `rpc_set_profile_identity(user, role, client_id, reason)` is the sanctioned
+  path. It requires a reason of at least eight characters, syncs `user_roles`,
+  refuses to remove the last active administrator (under the same
+  `lunadesk.admin_state` advisory lock as `rpc_set_admin_active`), and is
+  granted to **nobody** — `enforce_function_privileges()` closes it, so it is a
+  SQL-editor operation like `rpc_promote_admin`.
+* The invariant is enforced for every writer: a profile with a `client_id` must
+  have `role = 'client'`, and the client must exist. There is no state in which
+  an administrator is linked to a customer's portal.
+
+Sixteen assertions cover this (`supabase/tests/rls.sql` §9), including that a
+client cannot repoint themselves, that an admin cannot do it by plain `UPDATE`,
+and that the sanctioned path is audited and unreachable from the API.
+
+## 11.3 Financial integrity: duplicate references and editable line items
+
+Two gaps were reproduced against a live database:
+
+```
+NOTICE:  DUPLICATE REF ACCEPTED (payments=2, total_paid=80000)
+```
+
+Two ₹400 payments with reference `REF-1` both landed, so a double-submit was
+invisible to reconciliation. And `invoice_items` had no write guard at all:
+lines could be edited after payment, changing what a receipt claimed to bill
+while `invoices.total_minor` disagreed with the sum of its own items.
+
+`0013` adds:
+
+* `payments_invoice_reference_unique` — a partial unique index on
+  `(invoice_id, reference)` for non-voided rows. Voiding frees the reference, so
+  correcting a mistake is still possible. `rpc_record_payment` pre-checks with a
+  readable message and keeps a `unique_violation` backstop for the race.
+* `guard_invoice_items` — freezes line items once the invoice has a live payment
+  or a receipt, and recomputes the parent `subtotal_minor` / `total_minor` from
+  the items on every change, so a receipt snapshot can never contradict the
+  invoice.
+
+Eleven financial assertions were already passing (overpayment, zero, negative,
+receipt idempotency, receipt-for-voided, double void, direct payment insert,
+snapshot writes, archive with an outstanding balance); 25 more were added, for
+**202 assertions** in total.
+
+## 11.4 Configuration is now validated before it can ship
+
+`scripts/check-env.mjs` validates `VITE_SUPABASE_URL` (https, no path, not
+localhost in a deployed build), `VITE_SUPABASE_ANON_KEY` (JWT with `role: anon`,
+or `sb_publishable_…`; **`service_role` and `sb_secret_…` are hard failures**),
+`VITE_DATA_MODE` (`demo` requires an explicit `--allow-demo`), `BASE_PATH`
+(leading and trailing slash), `VITE_SUPPORT_EMAIL` and `VITE_VAPID_PUBLIC_KEY`.
+Its 14-case self-test runs in CI, so the validator cannot rot into a script that
+always passes. `scripts/test-verify-migrations.sh` and the validator's self-test
+are the two gates that police the gates.
+
+A runtime backstop in `main.tsx` renders a readable "LunaDesk could not start"
+screen with the reason (`role="alert"`) instead of a sign-in form that fails one
+request at a time.
+
+## 11.5 Checks actually run in this round
+
+All commands below were run in this workspace; results are copied, not estimated.
+
+| Command | Result |
+| --- | --- |
+| `npm run verify:db` (PostgreSQL 17, local) | pass — **13 migrations, 202 assertions**, 3 consecutive runs identical |
+| `npm run test:verifier` | pass — 14/14 |
+| `npm run test:bootstrap` | pass — 10/10 |
+| `npm run test:concurrency` | pass — 10/10 |
+| `npm run typecheck` | pass |
+| `npm run check:rpc` | pass — 42 SQL functions parsed, 7 bridged calls matched |
+| `npm run check:secrets` / `:history` | pass |
+| `npm run test:env` | pass — 14/14 |
+| `npm run build:demo` | pass — no sourcemaps, no OOM |
+| `npx playwright test e2e/smoke.spec.ts` | pass — **11/11** (Chromium 156, fresh server) |
+| privilege policy (`enforce_function_privileges`) | `rpc_set_profile_identity`, `guard_profile_identity` and `guard_invoice_items` have ACL `postgres=X` only; `identity_change_grants` grants nothing to any API role |
+| reminder delivery (`rpc_claim_reminder` / `rpc_complete_reminder_delivery`) | covered by the existing suite: double claim, stale-claim fencing, retry scheduling, snooze exclusion, timezone recurrence |
+| last-admin deactivation under concurrency | 10/10; two simultaneous demotions cannot empty the workspace |
+
+New regression coverage added this round: 16 identity assertions, 25 financial
+assertions, 1 browser test (admin creates a client end to end), 14 environment
+cases, and an assertion-count floor in `verify-migrations.sh` so deleting tests
+cannot turn a red suite green.
+
+## 11.6 Remaining risks
+
+| Risk | Why it remains | Mitigation |
+| --- | --- | --- |
+| The Edge Functions have never executed on Supabase's runtime | Deno + a real project are forbidden here | Their database half is fully tested; the TypeScript is typechecked and the RPC contract is machine-checked against the migrations |
+| `userClient()` is verified by inspection, not execution | Needs a real Auth Admin API | The rule is documented, and the RPC contract check would flag a renamed function |
+| PostgREST behaviour (RLS vs service key, JWT claims) is inferred | No project | Tested on PostgreSQL 17 with an `auth` shim; staging must re-run `supabase/tests/rls.sql` |
+| No push delivery, cron scheduling or DST transition has been observed | Needs a deployed project and real devices | The claim/advance SQL is tested; the UI states these limits rather than promising them |
+| Storage buckets and logo upload are untested | Need a real bucket | Bucket policies are written but unexercised |
+| `identity_change_grants` is only as safe as owner credentials | It is a SQL-editor capability by design | One-shot, 2-minute TTL, audited, and never granted to an API role |
+| Assertion floor is a number someone must raise | `MIN_ASSERTIONS` defaults to 190 | It can only be lowered deliberately, in a diff |
+
+## 11.7 Tests that still require a staging Supabase project
+
+These are the checks that **cannot** be run in this workspace and must be the
+acceptance list for staging:
+
+1. Apply `0001`–`0013` to a real project (`supabase db push`), then run
+   `supabase/tests/rls.sql` against it.
+2. Sign in as a real administrator and create a client from the UI — the exact
+   flow that was broken by the service-key bug (§11.1). Then issue a portal
+   code, revoke it, re-activate it.
+3. Sign in to the client portal with an issued code and confirm isolation:
+   invoices, projects, notes and receipts of another client must be invisible.
+4. Record a payment, issue a receipt, void the payment, re-record it with the
+   same reference, and confirm the printed receipt reprint is byte-identical
+   from its snapshot.
+5. Attempt a direct `update public.profiles set client_id = …` from the SQL
+   editor and confirm it is refused without an `identity_change_grants` row and
+   audited with one.
+6. Run `send-reminders` on a schedule and confirm: one delivery per occurrence,
+   a failed push is retried rather than lost, a stale claim is fenced, snoozed
+   reminders are excluded from the batch, and a `Asia/Kolkata` weekly reminder
+   keeps its local time across a DST boundary in another zone.
+7. Exercise `admin-clients` with more than 200 users to confirm pagination
+   (this is the one code path that only the real Auth Admin API exposes).
+8. Confirm `APP_ORIGINS` CORS fails closed: call an Edge Function from an
+   unlisted origin and expect a rejection.
+9. Deploy to GitHub Pages and confirm deep links, the service worker, and
+   `VITE_VAPID_PUBLIC_KEY` push subscription all work over https.
+10. Upload a logo through the admin UI and confirm the storage policy rejects a
+    client-role write.
+
+## 11.8 Production readiness
+
+**Not claimed.** The four defects in this round were all real and are fixed and
+guarded, and nothing in the repository is known to be broken. But every result
+above comes from PostgreSQL 17 and Chromium on one machine: no Edge Function has
+run on Supabase's runtime, no request has been authenticated against a real
+project, and no browser has received a real push message. The honest status is
+**ready for staging**, with §11.7 as the gate.

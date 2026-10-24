@@ -35,19 +35,20 @@ jobs:
         run: node scripts/check-rpc-contract.mjs
 
       # Fail here, with a readable message, instead of deploying a bundle that
-      # boots to an error screen. Keep these two repository secrets configured.
-      - name: Require live Supabase configuration
-        run: |
-          missing=0
-          if [ -z "${VITE_SUPABASE_URL:-}" ]; then echo "::error::Repository secret VITE_SUPABASE_URL is not set (Settings → Secrets and variables → Actions)."; missing=1; fi
-          if [ -z "${VITE_SUPABASE_ANON_KEY:-}" ]; then echo "::error::Repository secret VITE_SUPABASE_ANON_KEY is not set (Settings → Secrets and variables → Actions)."; missing=1; fi
-          if [ "$missing" = "1" ]; then
-            echo "A live deployment needs both values; refusing to publish a broken app."
-            exit 1
-          fi
+      # boots to an error screen. The validator checks shape as well as presence:
+      # https, no localhost, a key that is anon/publishable and never service_role.
+      - name: Environment validation (self-test)
+        run: npm run test:env
+
+      - name: Validate the deployment environment
         env:
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          VITE_SUPPORT_EMAIL: ${{ secrets.VITE_SUPPORT_EMAIL }}
+          VITE_VAPID_PUBLIC_KEY: ${{ secrets.VITE_VAPID_PUBLIC_KEY }}
+          VITE_DATA_MODE: live
+          BASE_PATH: /${{ github.event.repository.name }}/
+        run: npm run check:env
 
       - name: Secret scan of the tree
         run: node scripts/scan-secrets.mjs

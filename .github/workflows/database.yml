@@ -74,7 +74,7 @@ jobs:
         run: bash scripts/test-verify-migrations.sh
 
   static:
-    name: Types, RPC contract and secrets
+    name: Types, RPC contract, secrets and environment
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -97,3 +97,6 @@ jobs:
 
       - name: Secret scan (git history)
         run: node scripts/scan-secrets.mjs --history
+
+      - name: Environment validator (self-test)
+        run: node scripts/check-env.mjs --self-test

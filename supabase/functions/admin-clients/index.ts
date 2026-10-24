@@ -13,7 +13,7 @@
 // =============================================================================
 
 import { json, preflight } from '../_shared/http.ts';
-import { requireAdmin, serviceClient } from '../_shared/supabase.ts';
+import { requireAdmin, serviceClient, userClient } from '../_shared/supabase.ts';
 
 const CODE_PATTERN = /^[A-Z0-9]{5,20}$/;
 
@@ -129,6 +129,8 @@ Deno.serve(async (req) => {
     );
   }
 
+  // Read-only lookup: RLS would let an admin see this anyway, but the service
+  // client keeps the 404 path clean for a client id the caller cannot see.
   const supabase = serviceClient();
 
   const { data: client, error: clientError } = await supabase
@@ -148,7 +150,9 @@ Deno.serve(async (req) => {
 
       const userId = await ensureAuthUser(email, fullName, clientId);
 
-      const { error: rpcError } = await supabase.rpc('rpc_attach_client_portal', {
+      // The RPC checks assert_admin() via auth.uid(), so it MUST run with the
+      // caller's JWT. Only the Auth Admin calls above need the service client.
+      const { error: rpcError } = await userClient(caller.token).rpc('rpc_attach_client_portal', {
         p_client_id: clientId,
         p_user_id: userId,
         p_code: code,
@@ -160,7 +164,7 @@ Deno.serve(async (req) => {
     }
 
     if (action === 'rotate_code') {
-      const { error } = await supabase.rpc('rpc_change_client_access_code', {
+      const { error } = await userClient(caller.token).rpc('rpc_change_client_access_code', {
         p_client_id: clientId,
         p_code: code,
       });
@@ -169,7 +173,7 @@ Deno.serve(async (req) => {
     }
 
     if (action === 'revoke') {
-      const { error } = await supabase.rpc('rpc_revoke_client_access', {
+      const { error } = await userClient(caller.token).rpc('rpc_revoke_client_access', {
         p_client_id: clientId,
         p_reason: String(body.reason ?? 'Revoked by ' + (caller.email ?? 'admin')).slice(0, 400),
       });

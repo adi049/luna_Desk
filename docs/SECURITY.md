@@ -113,6 +113,12 @@ succeed. If the lookup code leaks, an attacker learns one address.
   portal identity works even if nobody rotated the code.
 - No password is ever created for a client account. There is nothing to phish
   beyond a 5-character code, which is rate-limited.
+- **The service key is not a caller.** `service_role` bypasses RLS but it has no
+  `auth.uid()`, so any RPC whose body calls `assert_admin()` or `is_client_of()`
+  fails with `42501` when it is invoked with the service key. Those RPCs must run
+  through `userClient(callerToken)` (anon key + the caller's JWT). The service
+  client is reserved for the Auth Admin API. This was the defect that made every
+  admin portal action fail in live mode while demo mode looked perfect.
 - `service_role` appears only inside `supabase/functions/**`. It is never read
   from `import.meta.env`, never bundled, and the frontend has no code path that
   could reach it.

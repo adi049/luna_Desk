@@ -36,9 +36,11 @@ supabase link --project-ref <your-ref>
 supabase db push          # applies supabase/migrations in order
 ```
 
-…or paste the files from `supabase/migrations/` into the SQL editor **in order**:
-`0001_schema.sql` → `0002_rls.sql` → `0003_rpc.sql` → `0004_audit_and_guards.sql`
-→ `0005_grants.sql` → `0006_admin_codes.sql`.
+…or paste the files from `supabase/migrations/` into the SQL editor **in order**,
+`0001` through `0013`. The last one,
+`0013_identity_and_financial_integrity.sql`, is the one that makes a client's
+role and portal link immutable from the API — apply it or an administrator can
+repoint a customer with a plain `UPDATE`.
 
 Verify locally before you push (recommended):
 
@@ -52,7 +54,28 @@ The same command is `npm run verify:db`. It needs a local PostgreSQL 15+ and
 database named `lunadesk_verify`.
 
 The script recreates a scratch database, applies every migration and runs
-`supabase/tests/rls.sql` (~48 assertions on isolation, money and access).
+`supabase/tests/rls.sql` (202 assertions on isolation, money, access, identity
+immutability and receipts).
+
+### Changing a customer's portal link
+
+Identity changes are deliberately not an API endpoint. From the **SQL editor**
+(owner credentials) only:
+
+```sql
+-- 1. The customer was created under the wrong client and never signed in.
+select public.rpc_set_profile_identity(
+  '<auth-user-uuid>',
+  'client',
+  '<client-uuid>',
+  're-created under the correct account, user never signed in'
+);
+```
+
+The call is audited (`profile.identity.change`), refuses to remove the last
+active administrator, and refuses to link a profile that is not a `client`.
+There is no UI for it, by design: a mis-click should not be able to move a
+customer's invoices to another company.
 
 ## 3. Storage bucket for the logo
 
@@ -195,11 +218,13 @@ block at the top of the file.
 | `npm run check:rpc` | every bridged browser call maps to a real, granted SQL function | — |
 | `npm run check:secrets` | no credential-shaped strings in tracked files | — |
 | `npm run check:secrets:history` | same, across all committed blobs | a git checkout |
-| `npm run verify:db` | all migrations apply; 161 RLS/RPC assertions pass | PostgreSQL 17 |
+| `npm run verify:db` | all migrations apply; 202 RLS/RPC assertions pass (the runner refuses to report success below `MIN_ASSERTIONS`) | PostgreSQL 17 |
 | `npm run test:bootstrap` | the bootstrap script refuses placeholders and never leaks the code | PostgreSQL 17 |
 | `npm run test:concurrency` | two simultaneous admin deactivations cannot empty the workspace | PostgreSQL 17 |
 | `npm run test:verifier` | the migration verifier really fails on a broken migration | PostgreSQL 17 |
-| `npm run test:e2e` | 10 Chromium tests: every route, guards, deep links, back/forward, one payment, three viewports | Chromium (`npx playwright install --with-deps chromium`) |
+| `npm run test:e2e` | 11 Chromium tests: every route, guards, deep links, back/forward, one payment, one client creation, three viewports | Chromium (`npx playwright install --with-deps chromium`) |
+| `npm run check:env` | the build environment is deployable (https URL, anon/publishable key, never `service_role`, valid `BASE_PATH`) | — |
+| `npm run test:env` | the environment validator's own 14 cases pass | — |
 
 The database suites run against a throwaway local database and never touch a
 Supabase project. `verify:db`, `test:bootstrap`, `test:concurrency` and
