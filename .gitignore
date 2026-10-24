@@ -1,17 +1,7 @@
-node_modules
-dist
-dist-ssr
+node_modules/
+dist/
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
+.supabase/
 .DS_Store
-*.local
-.vite
-coverage
-
-# TypeScript incremental build cache
-*.tsbuildinfo
-
-# Playwright artifacts
-test-results
-playwright-report
