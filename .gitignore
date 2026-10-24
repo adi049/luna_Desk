@@ -4,4 +4,4 @@ dist/
 .env.*
 !.env.example
 .supabase/
-.DS_Store
+.DS_Storesupabase/.temp/
