@@ -24,7 +24,9 @@
     "check:env": "node scripts/check-env.mjs",
     "test:env": "node scripts/check-env.mjs --self-test",
     "check:edge": "node scripts/check-edge-queries.mjs",
-    "test:edge": "node scripts/check-edge-queries.mjs --self-test"
+    "test:edge": "node scripts/check-edge-queries.mjs --self-test",
+    "test:functions": "deno test --allow-env supabase/functions/tests/",
+    "check:functions": "deno check supabase/functions/admin-clients/handler.ts"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.1",

@@ -255,6 +255,12 @@ begin
   select pr.timezone into v_tz from public.profiles pr where pr.id = v_reminder.owner_id;
   v_tz := coalesce(v_tz, 'Asia/Kolkata');
 
+  -- A stored zone that Postgres cannot resolve would make the date comparison
+  -- below raise instead of falling back, so it is normalised once, here.
+  if not exists (select 1 from pg_timezone_names where name = v_tz) then
+    v_tz := 'Asia/Kolkata';
+  end if;
+
   -- ---------------------------------------------------------------- failure
   if not p_push_ok then
     update public.reminder_deliveries
@@ -301,8 +307,13 @@ begin
     v_guard := v_guard + 1;
   end loop;
 
+  -- `repeat_until` is a plain date chosen by the user: the last local day the
+  -- series should run. Comparing it with `v_next::date` would reinterpret the
+  -- instant in the *session* time zone, so a reminder in a zone ahead of UTC
+  -- kept firing for one extra day and one behind UTC stopped a day early.
+  -- The instant is converted to the owner's zone first.
   v_expired := v_reminder.repeat_until is not null
-               and v_next::date > v_reminder.repeat_until;
+               and (v_next at time zone v_tz)::date > v_reminder.repeat_until;
 
   if v_expired then
     update public.reminders

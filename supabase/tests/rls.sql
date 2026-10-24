@@ -2236,6 +2236,192 @@ begin
 end $$;
 
 
+-- ===========================================================================
+-- 12. repeat_until is judged on the owner's calendar, not the session's
+--
+--     `rpc_complete_reminder_delivery` used to compare `v_next::date` with
+--     `repeat_until`. That cast reads the instant in the *session* time zone,
+--     so a series ended a day early in a zone behind UTC and kept firing a day
+--     too long in a zone ahead of it. These tests pin the session to UTC and
+--     give the owner a different zone, so the two calendars disagree.
+-- ===========================================================================
+reset role;
+select set_config('request.jwt.claim.sub', '', true);
+set local time zone 'UTC';
+
+do $$
+declare
+  v_owner    uuid := '44444444-4444-4444-8444-444444444444';
+  v_tz       text := 'Pacific/Auckland';
+  v_local    date;
+  v_remind   timestamptz;
+  v_occ      timestamptz;
+  v_rem_id   uuid;
+  v_claim    jsonb;
+  v_res      jsonb;
+begin
+  update public.profiles set timezone = v_tz where id = v_owner;
+  v_local := (now() at time zone v_tz)::date;
+
+  -- Tomorrow 00:30 in Auckland. In UTC that instant is *today* at ~11:30, so
+  -- the UTC date and the local date are different days.
+  v_remind := ((v_local + 1)::timestamp + time '00:30') at time zone v_tz;
+  v_occ    := v_remind;
+
+  insert into public.reminders (owner_id, title, remind_at, repeat, repeat_until)
+  values (v_owner, 'Local-date boundary (ahead of UTC)', v_remind, 'daily', v_local + 1)
+  returning id into v_rem_id;
+
+  v_claim := public.rpc_claim_reminder(v_rem_id, v_occ, 'tz-test', 300, 5);
+  v_res := public.rpc_complete_reminder_delivery(
+    v_rem_id, v_occ, (v_claim ->> 'token')::uuid, true, null);
+
+  perform public.test_assert(v_res ->> 'reason' = 'series_finished',
+    'a series whose next occurrence is past repeat_until in the owner''s zone finishes');
+  perform public.test_assert((v_res ->> 'advanced')::boolean,
+    'finishing the series still advances the reminder out of the queue');
+  perform public.test_assert(
+    (select fired_at from public.reminders where id = v_rem_id) is not null,
+    'the finished series is marked as fired');
+
+  -- Sanity: the two calendars really do disagree for this fixture, otherwise
+  -- the assertion above would pass for the wrong reason.
+  perform public.test_assert(
+    (v_remind at time zone v_tz)::date <> (v_remind at time zone 'UTC')::date,
+    'the fixture straddles a date boundary between the owner zone and the session zone');
+end $$;
+
+-- 12b. A zone behind UTC: the series must NOT end a day early.
+do $$
+declare
+  v_owner  uuid := '44444444-4444-4444-8444-444444444444';
+  v_tz     text := 'America/Los_Angeles';
+  v_local  date;
+  v_remind timestamptz;
+  v_next   timestamptz;
+  v_rem_id uuid;
+  v_claim  jsonb;
+  v_res    jsonb;
+begin
+  update public.profiles set timezone = v_tz where id = v_owner;
+  v_local := (now() at time zone v_tz)::date;
+
+  -- Tomorrow 23:30 in Los Angeles. In UTC that is the day after tomorrow, so a
+  -- UTC-based comparison would think the series had already run out of days.
+  v_remind := ((v_local + 1)::timestamp + time '23:30') at time zone v_tz;
+  v_next   := public.next_occurrence_tz(v_remind, 'daily', v_tz);
+
+  perform public.test_assert(
+    (v_next at time zone 'UTC')::date > (v_next at time zone v_tz)::date,
+    'the fixture straddles a date boundary in the other direction');
+
+  insert into public.reminders (owner_id, title, remind_at, repeat, repeat_until)
+  values (v_owner, 'Local-date boundary (behind UTC)', v_remind, 'daily',
+          (v_next at time zone v_tz)::date)
+  returning id into v_rem_id;
+
+  v_claim := public.rpc_claim_reminder(v_rem_id, v_remind, 'tz-test', 300, 5);
+  v_res := public.rpc_complete_reminder_delivery(
+    v_rem_id, v_remind, (v_claim ->> 'token')::uuid, true, null);
+
+  perform public.test_assert(v_res ->> 'reason' = 'delivered',
+    'a series still inside its local range is not ended early');
+  perform public.test_assert((v_res ->> 'next_occurrence')::timestamptz = v_next,
+    'the next occurrence is the expected local wall-clock step');
+
+  -- And the opposite control: a repeat_until that really is in the past ends it.
+  -- A fresh occurrence is used because the one above is already delivered.
+  update public.reminders set repeat_until = v_local - 1 where id = v_rem_id;
+  v_claim := public.rpc_claim_reminder(v_rem_id, v_next, 'tz-test', 300, 5);
+  v_res := public.rpc_complete_reminder_delivery(
+    v_rem_id, v_next, (v_claim ->> 'token')::uuid, true, null);
+  perform public.test_assert(v_res ->> 'reason' = 'series_finished',
+    'a repeat_until that has passed ends the series');
+end $$;
+
+-- 12c. A DST change between the occurrence and the next one, judged on the
+--      local calendar. Europe/Berlin springs forward on the last Sunday of
+--      March at 02:00, so 00:30 is CET and the following 00:30 is CEST: a
+--      23-hour step, not 24.
+do $$
+declare
+  v_owner  uuid := '44444444-4444-4444-8444-444444444444';
+  v_tz     text := 'Europe/Berlin';
+  v_today  date;
+  v_dst    date;
+  v_remind timestamptz;
+  v_next   timestamptz;
+  v_rem_id uuid;
+  v_claim  jsonb;
+  v_res    jsonb;
+begin
+  update public.profiles set timezone = v_tz where id = v_owner;
+  v_today := (now() at time zone v_tz)::date;
+
+  -- Last Sunday of March, current year; next year when that has already gone.
+  v_dst := make_date(extract(year from v_today)::int, 3, 31);
+  v_dst := v_dst - extract(dow from v_dst)::int;
+  if v_dst <= v_today then
+    v_dst := make_date(extract(year from v_today)::int + 1, 3, 31);
+    v_dst := v_dst - extract(dow from v_dst)::int;
+  end if;
+
+  v_remind := (v_dst::timestamp + time '00:30') at time zone v_tz;
+  v_next   := public.next_occurrence_tz(v_remind, 'daily', v_tz);
+
+  perform public.test_assert(v_next - v_remind = interval '23 hours',
+    'the step across the spring change is 23 hours long');
+  perform public.test_assert((v_next at time zone v_tz)::time = time '00:30',
+    'the wall clock is preserved across the change');
+  perform public.test_assert(
+    (v_next at time zone 'UTC')::date = v_dst,
+    'the next occurrence falls on a different UTC date than its local date');
+
+  insert into public.reminders (owner_id, title, remind_at, repeat, repeat_until)
+  values (v_owner, 'DST boundary', v_remind, 'daily', v_dst)
+  returning id into v_rem_id;
+
+  v_claim := public.rpc_claim_reminder(v_rem_id, v_remind, 'tz-test', 300, 5);
+  v_res := public.rpc_complete_reminder_delivery(
+    v_rem_id, v_remind, (v_claim ->> 'token')::uuid, true, null);
+
+  perform public.test_assert(v_res ->> 'reason' = 'series_finished',
+    'a series ending the day before the next local occurrence finishes, across a DST change');
+end $$;
+
+-- 12d. Unknown or missing zones fall back instead of mis-comparing or raising.
+do $$
+declare
+  v_owner  uuid := '44444444-4444-4444-8444-444444444444';
+  v_remind timestamptz := now() + interval '1 day';
+  v_rem_id uuid;
+  v_claim  jsonb;
+  v_res    jsonb;
+  v_until  date;
+begin
+  update public.profiles set timezone = 'Not/AZone' where id = v_owner;
+
+  -- The series runs to the local date of its next occurrence, computed with the
+  -- fallback zone the function is expected to use.
+  v_until := (public.next_occurrence_tz(v_remind, 'daily', 'Asia/Kolkata')
+              at time zone 'Asia/Kolkata')::date;
+
+  insert into public.reminders (owner_id, title, remind_at, repeat, repeat_until)
+  values (v_owner, 'Unknown zone', v_remind, 'daily', v_until)
+  returning id into v_rem_id;
+
+  v_claim := public.rpc_claim_reminder(v_rem_id, v_remind, 'tz-test', 300, 5);
+  v_res := public.rpc_complete_reminder_delivery(
+    v_rem_id, v_remind, (v_claim ->> 'token')::uuid, true, null);
+
+  perform public.test_assert(v_res ->> 'reason' = 'delivered',
+    'an unresolvable stored zone falls back to Asia/Kolkata instead of failing');
+
+  update public.profiles set timezone = 'Asia/Kolkata' where id = v_owner;
+  reset role;
+end $$;
+
+
 rollback;
 
 drop function if exists public.test_assert(boolean, text);

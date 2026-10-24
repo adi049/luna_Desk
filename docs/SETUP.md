@@ -56,8 +56,9 @@ The same command is `npm run verify:db`. It needs a local PostgreSQL 15+ and
 database named `lunadesk_verify`.
 
 The script recreates a scratch database, applies every migration and runs
-`supabase/tests/rls.sql` (237 assertions on isolation, money, access, identity
-immutability, receipts, line-item integrity and DST-safe recurrence).
+`supabase/tests/rls.sql` (250 assertions on isolation, money, access, identity
+immutability, receipts, line-item integrity, DST-safe recurrence and
+local-calendar series ends).
 
 ### Changing a customer's portal link
 
@@ -236,13 +237,15 @@ block at the top of the file.
 | `npm run check:rpc` | every bridged browser call maps to a real, granted SQL function | — |
 | `npm run check:secrets` | no credential-shaped strings in tracked files | — |
 | `npm run check:secrets:history` | same, across all committed blobs | a git checkout |
-| `npm run verify:db` | all migrations apply; 237 RLS/RPC assertions pass (the runner refuses to report success below `MIN_ASSERTIONS`) | PostgreSQL 17 |
+| `npm run verify:db` | all migrations apply; 250 RLS/RPC assertions pass (the runner refuses to report success below `MIN_ASSERTIONS`) | PostgreSQL 17 |
 | `npm run test:bootstrap` | the bootstrap script refuses placeholders and never leaks the code | PostgreSQL 17 |
-| `npm run test:concurrency` | two simultaneous admin deactivations cannot empty the workspace | PostgreSQL 17 |
+| `npm run test:concurrency` | simultaneous admin deactivations, and demotions racing deactivations, cannot empty the workspace (serial + 3 mixed directions) | PostgreSQL 17 |
 | `npm run test:verifier` | the migration verifier really fails on a broken migration | PostgreSQL 17 |
 | `npm run test:e2e` | 11 Chromium tests: every route, guards, deep links, back/forward, one payment, one client creation, three viewports | Chromium (`npx playwright install --with-deps chromium`) |
 | `npm run check:edge` | every Edge Function query binds and checks its `error` |
 | `npm run test:edge` | the Edge query checker's own 8 cases pass |
+| `npm run test:functions` | the admin-clients handler runs in Deno against fakes: 6 cases, including "never delete an account this request did not create" | Deno 2.x |
+| `npm run check:functions` | the Edge handler typechecks | Deno 2.x |
 | `npm run check:env` | the build environment is deployable (https URL, anon/publishable key, never `service_role`, valid `BASE_PATH`) | — |
 | `npm run test:env` | the environment validator's own 14 cases pass | — |
 

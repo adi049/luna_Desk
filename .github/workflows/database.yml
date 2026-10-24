@@ -74,7 +74,7 @@ jobs:
         run: bash scripts/test-verify-migrations.sh
 
   static:
-    name: Types, RPC contract, Edge queries, secrets and environment
+    name: Types, RPC contract, Edge Functions, secrets and environment
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -106,3 +106,12 @@ jobs:
 
       - name: Edge Function query checker (self-test)
         run: node scripts/check-edge-queries.mjs --self-test
+
+      # The provisioning-cleanup handler is executed, not just typechecked: it
+      # decides whether a failed portal creation deletes an account.
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Edge Function handler tests (Deno)
+        run: deno test --allow-env supabase/functions/tests/

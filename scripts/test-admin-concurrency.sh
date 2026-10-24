@@ -34,11 +34,13 @@ ROUNDS="${ROUNDS:-5}"
 
 ADMIN_A="aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
 ADMIN_B="aaaaaaaa-2222-4222-8222-aaaaaaaaaaaa"
+RACE_CLIENT="aaaaaaaa-3333-4333-8333-aaaaaaaaaaaa"
 
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/lunadesk-race.XXXXXX")"
 cleanup() {
   rm -rf "$WORKDIR"
   psql -X -q -d "$DATABASE" -c "
+    delete from public.clients     where id = '$RACE_CLIENT';
     delete from public.user_roles  where user_id in ('$ADMIN_A','$ADMIN_B');
     delete from public.audit_logs  where actor_id in ('$ADMIN_A','$ADMIN_B')
                                       or entity_id in ('$ADMIN_A','$ADMIN_B');
@@ -108,12 +110,16 @@ fail() { printf '✗ FAIL: %s\n' "$1" >&2; FAIL=$((FAIL + 1)); }
 for round in $(seq 1 "$ROUNDS"); do
   # Reset: everybody active again.
   psql_x -c "
-    update public.profiles set is_active = true
-     where id in ('$ADMIN_A','$ADMIN_B');
     insert into public.user_roles (user_id, role)
       select id, 'admin' from public.profiles
        where id in ('$ADMIN_A','$ADMIN_B')
       on conflict (user_id, role) do nothing;
+    select public.rpc_authorise_identity_change('$ADMIN_A', 'fixture: reset race admin A');
+    update public.profiles set role = 'admin', client_id = null, is_active = true
+     where id = '$ADMIN_A';
+    select public.rpc_authorise_identity_change('$ADMIN_B', 'fixture: reset race admin B');
+    update public.profiles set role = 'admin', client_id = null, is_active = true
+     where id = '$ADMIN_B';
   " >/dev/null
 
   # A acts as A deactivating B, and holds its transaction open.
@@ -154,6 +160,112 @@ for round in $(seq 1 "$ROUNDS"); do
   else
     fail "round $round: both concurrent deactivations were allowed"
   fi
+done
+
+# ---------------------------------------------------------------------------
+# Mixed race: a demotion through rpc_set_profile_identity against a
+# deactivation through rpc_set_admin_active.
+#
+# Both functions protect the same global invariant ("at least one active
+# administrator"), so they must serialise on the same lock, taken in the same
+# order. If rpc_set_profile_identity takes the profile row lock *before* the
+# advisory lock, the two functions can each hold a row and each count the other
+# administrator as still active — and the workspace ends up with nobody.
+#
+# Scenario, repeated ROUNDS times each way:
+#
+#   session A  begin; demote(B, role='client'); sleep; commit;
+#   session B  (starts 0.6s later) begin; deactivate(A); commit;
+#
+# and the mirror image, and a demote-demote race.
+# ---------------------------------------------------------------------------
+psql_x -c "
+  insert into public.clients (id, name, business_name, client_code, status)
+  values ('$RACE_CLIENT', 'Race Client', 'Race Client', 'RACE01', 'active')
+  on conflict (id) do nothing;
+" >/dev/null || true
+
+# mixed_session <file> <acting user> <sql body> <sleep seconds>
+mixed_session() {
+  cat >"$1" <<SQL
+\set ON_ERROR_STOP off
+begin;
+select set_config('request.jwt.claim.sub', '$2', true);
+$3
+select pg_sleep($4);
+commit;
+SQL
+}
+
+for round in $(seq 1 "$ROUNDS"); do
+  for direction in demote_then_deactivate deactivate_then_demote demote_then_demote; do
+
+    # Reset both admins, authorised (setting a role is an identity change).
+    psql_x -c "
+      select public.rpc_authorise_identity_change('$ADMIN_A', 'fixture: reset mixed race A');
+      update public.profiles set role = 'admin', client_id = null, is_active = true
+       where id = '$ADMIN_A';
+      select public.rpc_authorise_identity_change('$ADMIN_B', 'fixture: reset mixed race B');
+      update public.profiles set role = 'admin', client_id = null, is_active = true
+       where id = '$ADMIN_B';
+      insert into public.user_roles (user_id, role)
+        select id, 'admin' from public.profiles where id in ('$ADMIN_A','$ADMIN_B')
+       on conflict (user_id, role) do nothing;
+    " >/dev/null
+
+    demote_b="select public.rpc_set_profile_identity('$ADMIN_B', 'client', '$RACE_CLIENT', 'race: demote B');"
+    demote_a="select public.rpc_set_profile_identity('$ADMIN_A', 'client', '$RACE_CLIENT', 'race: demote A');"
+    deactivate_a="select public.rpc_set_admin_active('$ADMIN_A', false);"
+    deactivate_b="select public.rpc_set_admin_active('$ADMIN_B', false);"
+
+    case "$direction" in
+      demote_then_deactivate)
+        first_sql="$demote_b";  first_user="$ADMIN_A"
+        second_sql="$deactivate_a"; second_user="$ADMIN_B" ;;
+      deactivate_then_demote)
+        first_sql="$deactivate_b"; first_user="$ADMIN_A"
+        second_sql="$demote_a";    second_user="$ADMIN_B" ;;
+      *)
+        first_sql="$demote_b";  first_user="$ADMIN_A"
+        second_sql="$demote_a"; second_user="$ADMIN_B" ;;
+    esac
+
+    mixed_session "$WORKDIR/m1.sql" "$first_user"  "$first_sql"  "2"
+    mixed_session "$WORKDIR/m2.sql" "$second_user" "$second_sql" "0"
+
+    psql -X -q -t -A -v ON_ERROR_STOP=0 -d "$DATABASE" -f "$WORKDIR/m1.sql" \
+      >"$WORKDIR/m1.out" 2>"$WORKDIR/m1.err" &
+    pid_1=$!
+    sleep 0.6
+    psql -X -q -t -A -v ON_ERROR_STOP=0 -d "$DATABASE" -f "$WORKDIR/m2.sql" \
+      >"$WORKDIR/m2.out" 2>"$WORKDIR/m2.err" &
+    pid_2=$!
+    wait "$pid_1"
+    wait "$pid_2"
+
+    successes=0
+    grep -q '"changed": true' "$WORKDIR/m1.out" && successes=$((successes + 1))
+    grep -q '"changed": true' "$WORKDIR/m2.out" && successes=$((successes + 1))
+
+    remaining="$(psql_x -c "
+      select count(*) from public.profiles
+       where role = 'admin' and is_active
+         and id in ('$ADMIN_A','$ADMIN_B');")"
+
+    label="$direction, round $round"
+    if [[ "$remaining" -ge 1 ]]; then
+      pass "$label: an active administrator survives ($remaining remain)"
+    else
+      fail "$label: BOTH changes committed — the workspace has no active admin"
+      sed -n '1,8p' "$WORKDIR/m1.out" "$WORKDIR/m2.out" "$WORKDIR/m1.err" "$WORKDIR/m2.err" >&2
+    fi
+
+    if [[ "$successes" -le 1 ]]; then
+      pass "$label: only one change took effect ($successes)"
+    else
+      fail "$label: both concurrent admin removals were allowed"
+    fi
+  done
 done
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

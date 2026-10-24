@@ -315,21 +315,35 @@ begin
     raise exception 'An administrator cannot be linked to a client portal' using errcode = '22023';
   end if;
 
+  -- Lock order matters, and it must match rpc_set_admin_active() (0012).
+  --
+  -- The advisory lock is taken FIRST, then the row. Taking the row lock first
+  -- let two transactions hold a row each and queue on the advisory lock in
+  -- opposite orders: each then read the other administrator as "still active"
+  -- before its own commit, and both proceeded — the workspace could end up
+  -- with no administrator at all. A single constant key is used because the
+  -- invariant ("at least one active admin exists") is global, not per row.
+  perform pg_advisory_xact_lock(hashtext('lunadesk.admin_state'));
+
   select * into v_profile from public.profiles where id = p_user_id for update;
   if not found then
     raise exception 'Profile % does not exist', p_user_id using errcode = '23503';
   end if;
 
-  -- Serialise with every other admin-state change (0012).
-  perform pg_advisory_xact_lock(hashtext('lunadesk.admin_state'));
-
+  -- Re-checked under the lock, against the freshly read row: an administrator
+  -- may have been deactivated or promoted since this transaction started.
   if v_profile.role = 'admin' and p_role <> 'admin' then
-    select count(*) into v_admins
-      from public.profiles
-     where role = 'admin' and is_active and id <> p_user_id;
-    if v_admins = 0 then
-      raise exception 'Refusing to remove the last active administrator'
-        using errcode = '42501';
+    if not v_profile.is_active then
+      -- Demoting an already-inactive admin cannot remove the last active one.
+      null;
+    else
+      select count(*) into v_admins
+        from public.profiles
+       where role = 'admin' and is_active and id <> p_user_id;
+      if v_admins = 0 then
+        raise exception 'Refusing to remove the last active administrator'
+          using errcode = '42501';
+      end if;
     end if;
   end if;
 
@@ -547,6 +561,26 @@ end $$;
 
 revoke all on function public.next_occurrence_tz(timestamptz, reminder_repeat, text)
   from public, anon, authenticated, service_role;
+
+-- ---------------------------------------------------------------------------
+-- E2. Self-check: the lock order in rpc_set_profile_identity must match
+--     rpc_set_admin_active(). Row-then-advisory is the interleaving that lets
+--     two transactions each believe the other administrator survives.
+-- ---------------------------------------------------------------------------
+do $$
+declare v_body text;
+begin
+  select pg_get_functiondef('public.rpc_set_profile_identity(uuid, app_role, uuid, text)'::regprocedure)
+    into v_body;
+
+  if position('pg_advisory_xact_lock' in v_body) = 0 then
+    raise exception 'rpc_set_profile_identity no longer serialises admin state changes';
+  end if;
+
+  if position('pg_advisory_xact_lock' in v_body) > position('for update' in v_body) then
+    raise exception 'rpc_set_profile_identity must take the advisory lock before the profile row';
+  end if;
+end $$;
 
 -- ---------------------------------------------------------------------------
 -- F. Re-apply the privilege policy, so the two new/rewritten helper functions

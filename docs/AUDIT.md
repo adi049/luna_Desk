@@ -1,8 +1,9 @@
 # Pre-Supabase audit — LunaDesk
 
-Date: 2026-10-23, extended 2026-10-24 (four times)
-Scope: the repository as committed at `ae7c200`, hardened locally in five
-rounds. §9 is the second round, §10 the third, §11 the fourth, §12 the fifth.
+Date: 2026-10-23, extended 2026-10-24 (five times)
+Scope: the repository as committed at `ae7c200`, hardened locally in six
+rounds. §9 is the second round, §10 the third, §11 the fourth, §12 the fifth,
+§13 the sixth and final correction pass.
 **No live Supabase project was contacted, created or modified.** Every database
 result below comes from a local PostgreSQL 17 instance running the migrations in
 `supabase/migrations/`.
@@ -1183,3 +1184,172 @@ looked like code bugs. They now re-apply the migrations every run
 **Still not claimed**, for the same reason as §11.8: nothing here has ever
 authenticated against a real project. What changed is that the four defects
 above were real, are fixed, and now have tests that fail without the fix.
+
+---
+
+# 13. Sixth round — three corrections and an honest test ledger
+
+Three defects, each fixed in the file that owns the behaviour, each with a test
+that was run twice: once against the pre-fix code (to prove it reproduces), once
+against the fix (to prove it passes).
+
+## 13.1 A failed portal creation left an orphaned Auth user
+
+`admin-clients` created an Auth user and then called
+`rpc_attach_client_portal`. If the RPC failed, the newly created user stayed
+behind: it could not sign in (no access code works for it), but it occupied the
+email address, so the next attempt found it and skipped creation — leaving a
+half-provisioned portal that looked like a lookup bug.
+
+**Fix.** `ensureAuthUser()` now returns `{ id, created }` and `created` is true
+*only* in the branch that actually called `createUser()`. On an RPC failure:
+
+| Situation | Behaviour |
+| --- | --- |
+| this request created the account | `auth.admin.deleteUser(id)`, reported as `orphan_removed: true` |
+| the account already existed | never deleted; response says "the existing account was left untouched" |
+| this request lost a creation race | the winner's account is adopted, `created: false`, never deleted |
+| deletion itself fails | logged with a recovery reference `portal-cleanup:<user id>` and returned as `recovery_reference` |
+
+Nothing logs the access code, the JWT, or an email address — the log carries the
+user id and the client id, which are the two values an operator needs and the
+two the calling administrator can already see.
+
+**Test.** The handler was split into `admin-clients/handler.ts` (no Supabase
+imports; the clients are injected) and `admin-clients/index.ts` (the wiring), so
+it can be executed. `supabase/functions/tests/admin-clients.test.ts` runs the
+real handler in Deno 2.9.8 with fake clients — 6 tests covering all four rows
+above plus the success path and a lookup failure. Deleting the guard
+(`if (user.created)` → `if (false)`) makes two of them fail, which is how they
+were validated.
+
+## 13.2 `repeat_until` was compared on the session calendar
+
+`rpc_complete_reminder_delivery()` decided whether a repeating series had ended
+with `v_next::date > v_reminder.repeat_until`. `v_next` is a `timestamptz`, so
+`::date` reads it in the **session** time zone — the database's, not the
+reminder owner's. For a 09:00 reminder in a zone ahead of UTC, the local date is
+already tomorrow when UTC is still today, so the series ran one occurrence too
+long; in a zone behind UTC it stopped a day early.
+
+**Fix (in `0011`, where the function is defined).** The instant is converted to
+the owner's zone before the date is taken:
+
+```sql
+v_expired := v_reminder.repeat_until is not null
+             and (v_next at time zone v_tz)::date > v_reminder.repeat_until;
+```
+
+An unresolvable stored zone now falls back to `Asia/Kolkata` explicitly, rather
+than raising inside `at time zone`.
+
+**Tests** (`supabase/tests/rls.sql` §12, 13 assertions). The session is pinned to
+`UTC` while the owner's zone is not, so the two calendars disagree on purpose.
+Each scenario asserts that the fixture really does straddle the boundary,
+otherwise the test could pass for the wrong reason.
+
+| Scenario | Pre-fix | Post-fix (asserted) |
+| --- | --- | --- |
+| Auckland, occurrence at 00:30 local (ahead of UTC) | `delivered` | `series_finished` |
+| Los Angeles, occurrence at 23:30 local (behind UTC) | `series_finished` | `delivered` |
+| Europe/Berlin, across the last-Sunday-of-March spring change (23-hour step) | `delivered` | `series_finished` |
+
+The Berlin case also asserts the step is exactly 23 hours and that the wall
+clock stays at 00:30, so a naive fixed 24-hour step fails it too. The dates are
+computed relative to `now()`, so the tests do not rot as the calendar advances.
+
+## 13.3 `rpc_set_profile_identity` locked the row before the advisory lock
+
+0012 made `rpc_set_admin_active` take `pg_advisory_xact_lock(hashtext('lunadesk.admin_state'))`
+*before* reading the target row. 0014's `rpc_set_profile_identity` did the
+opposite: `select … for update`, then the advisory lock. Two paths that guard the
+same global invariant were serialising on different orders.
+
+**Fix.** The advisory lock is now taken first, then the row, and the
+last-active-admin check runs under the lock against the freshly read row (an
+administrator may have been deactivated since the transaction began). Demoting
+an already-inactive administrator no longer needs the count.
+
+A self-check block in `0014` fails the migration if the two positions are ever
+reversed — verified by reversing them:
+
+```
+✗ migration 0014 FAILED
+ERROR:  rpc_set_profile_identity must take the advisory lock before the profile row
+```
+
+## 13.4 Mixed-concurrency regression tests
+
+`scripts/test-admin-concurrency.sh` now races the two paths against each other,
+in three directions, `ROUNDS` times each:
+
+```
+demote_then_deactivate   session A: rpc_set_profile_identity(B → client)  ‖  session B: rpc_set_admin_active(A, false)
+deactivate_then_demote   session A: rpc_set_admin_active(B, false)        ‖  session B: rpc_set_profile_identity(A → client)
+demote_then_demote       session A: rpc_set_profile_identity(B → client)  ‖  session B: rpc_set_profile_identity(A → client)
+```
+
+Each direction opens two real connections, the first holding its transaction
+open for two seconds. Pass condition after every round: at least one active
+administrator remains **and** the two sessions did not both succeed.
+
+Validation: with the correct implementation, 40/40 pass (5 rounds × 4
+directions × 2 assertions). With a mutation that hoists the last-admin count
+*above* the advisory lock — the exact staleness the lock exists to prevent —
+8 of 16 fail:
+
+```
+✗ FAIL: deactivate_then_demote, round 1: BOTH changes committed — the workspace has no active admin
+✗ FAIL: demote_then_demote, round 1: BOTH changes committed — the workspace has no active admin
+8 passed, 8 failed
+```
+
+## 13.5 What was verified, and where
+
+Three categories, kept separate on purpose.
+
+**A. Verified here — executed, no external service**
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Types | `npm run typecheck` | pass |
+| Browser bundle | `npm run build:demo` | pass |
+| RPC contract | `npm run check:rpc` | pass — 42 functions, 7 bridged calls |
+| Edge query errors | `npm run check:edge` + `--self-test` | pass · 8/8 |
+| Edge handler behaviour | `npm run test:functions` (Deno 2.9.8) | pass — **6/6**, and 2 fail when cleanup is disabled |
+| Handler typecheck | `npm run check:functions` | pass |
+| Environment validator | `npm run test:env` | pass — 14/14 |
+| Secret scans | `npm run check:secrets` / `:history` | pass |
+| Browser workflows | `npx playwright test e2e/smoke.spec.ts` | pass — 11/11 |
+
+**B. Verified here — requires PostgreSQL (local 17.11; no Supabase project)**
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Migrations + RLS/RPC | `npm run verify:db` | pass — **14 migrations, 250 assertions**, 3 identical runs |
+| Bootstrap safety | `npm run test:bootstrap` | pass — 10/10 |
+| Admin-state concurrency (serial + mixed) | `npm run test:concurrency` | pass — 40/40 |
+| Verifier meta-test | `npm run test:verifier` | pass — 14/14 |
+| Mutation: session-TZ `repeat_until` | — | 3/3 scenarios invert (table in §13.2) |
+| Mutation: count before the lock | — | mixed race fails 8/16 (§13.4) |
+| Mutation: reversed lock order | — | migration self-check fails (§13.3) |
+| Mutation: cleanup disabled | — | 2 Deno tests fail (§13.1) |
+
+**C. NOT verified — requires staging Supabase (or a real device)**
+
+| Not verified | Why it cannot be run here |
+| --- | --- |
+| `admin-clients` on Supabase's runtime | The handler is executed in Deno with fakes; the real Auth Admin API, JWT verification and `Deno.serve` wiring are not exercised |
+| That `deleteUser` really removes the right row in a live project | Needs real Auth Admin credentials |
+| RLS/RPC against PostgREST | Local PostgreSQL with an `auth` shim; PostgREST's JWT handling is inferred |
+| `send-reminders` end to end (push, leases, cron) | Needs deployed functions, VAPID keys and a browser |
+| Multi-connection races across a network | Races run on two local connections; latency profiles differ |
+| Storage bucket policies, logo upload | Needs a real bucket |
+| DST behaviour on a device clock | SQL recurrence is tested; the browser's own timer handling is not |
+
+## 13.6 Production readiness
+
+**Still not claimed.** Everything in A and B was actually executed and is
+reproducible from the repository; everything in C needs a real project. The
+honest status is unchanged: ready for a staging deployment, with §11.7 and §13.5C
+as the acceptance list.
